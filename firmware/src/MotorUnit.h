@@ -17,8 +17,8 @@
 // Ki: integral gain; eliminates steady-state error.
 // Kd: set to zero to avoid amplifying high-frequency encoder noise;
 //     increase only if overshoot is observed with a well-filtered encoder.
-#define STEERING_KP 5.0f
-#define STEERING_KI 0.02f
+#define STEERING_KP 2.5f
+#define STEERING_KI 0.01f
 #define STEERING_KD 0.0f
 
 // Motor stops when angle error is within this deadband (degrees).

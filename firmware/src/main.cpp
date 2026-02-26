@@ -13,7 +13,7 @@
 //   I2C speed         : 200 kHz
 //   I2C Mux address   : 0x70
 //
-// Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: steering123)
+// Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
 
 #include <Arduino.h>
@@ -28,7 +28,7 @@
 // WiFi Access Point credentials
 // ---------------------------------------------------------------------------
 static const char* AP_SSID = "SaunaBoatSteering";
-static const char* AP_PASS = "steering123";
+static const char* AP_PASS = "12345678";
 
 // ---------------------------------------------------------------------------
 // Maslow 4 board pin definitions – Bottom-Right motor port
