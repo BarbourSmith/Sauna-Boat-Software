@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sauna Boat – Auto Steering</title>
+  <style>
+    :root {
+      --bg:        #0d1b2a;
+      --panel:     #1b2d42;
+      --accent:    #00b4d8;
+      --accent2:   #f77f00;
+      --text:      #e0e0e0;
+      --subtext:   #8fa8c0;
+      --green:     #4ade80;
+      --red:       #f87171;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+      gap: 24px;
+    }
+
+    /* ── Header ── */
+    header {
+      text-align: center;
+    }
+    header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--accent);
+    }
+    header p {
+      font-size: 0.85rem;
+      color: var(--subtext);
+      margin-top: 4px;
+    }
+
+    /* ── Status pill ── */
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border-radius: 999px;
+      padding: 6px 16px;
+      font-size: 0.82rem;
+    }
+    #status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+    #status-dot.connected { background: var(--green); }
+    #status-text { color: var(--subtext); }
+
+    /* ── Compass card ── */
+    .card {
+      background: var(--panel);
+      border-radius: 16px;
+      padding: 24px;
+      width: 100%;
+      max-width: 420px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+
+    /* ── SVG compass ── */
+    #compass-wrap {
+      position: relative;
+      width: 240px;
+      height: 240px;
+    }
+    #compass-svg {
+      width: 100%; height: 100%;
+    }
+    /* target needle (accent blue) */
+    #needle-target {
+      transform-origin: 120px 120px;
+      transition: transform 0.3s ease;
+    }
+    /* current needle (orange) */
+    #needle-current {
+      transform-origin: 120px 120px;
+      transition: transform 0.15s linear;
+    }
+
+    /* ── Angle readouts ── */
+    .readouts {
+      display: flex;
+      gap: 24px;
+      justify-content: center;
+      width: 100%;
+    }
+    .readout {
+      text-align: center;
+      flex: 1;
+    }
+    .readout-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--subtext);
+      margin-bottom: 4px;
+    }
+    .readout-value {
+      font-size: 2rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .readout-value.target  { color: var(--accent); }
+    .readout-value.current { color: var(--accent2); }
+    .readout-unit {
+      font-size: 0.85rem;
+      color: var(--subtext);
+      margin-left: 2px;
+    }
+
+    /* ── Slider section ── */
+    .slider-section {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .slider-label {
+      font-size: 0.8rem;
+      color: var(--subtext);
+      min-width: 28px;
+      text-align: right;
+    }
+    input[type="range"] {
+      flex: 1;
+      -webkit-appearance: none;
+      height: 6px;
+      border-radius: 3px;
+      background: #2a3f57;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 3px solid var(--bg);
+      box-shadow: 0 0 6px rgba(0,180,216,0.6);
+      cursor: pointer;
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 3px solid var(--bg);
+      cursor: pointer;
+    }
+
+    /* ── Preset buttons ── */
+    .presets {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .preset-btn {
+      background: #1e3448;
+      border: 1px solid #2a4a6a;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 14px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    .preset-btn:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+
+    /* ── Legend ── */
+    .legend {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      font-size: 0.78rem;
+      color: var(--subtext);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legend-swatch {
+      width: 18px; height: 4px;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>⛵ Auto Steering</h1>
+    <p>Maslow 4 Boat Control System</p>
+  </header>
+
+  <!-- Connection status -->
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+
+  <!-- Main card -->
+  <div class="card">
+
+    <!-- Compass display -->
+    <div id="compass-wrap">
+      <svg id="compass-svg" viewBox="0 0 240 240">
+        <!-- Outer ring -->
+        <circle cx="120" cy="120" r="116" fill="none" stroke="#2a3f57" stroke-width="3"/>
+        <!-- Tick marks & cardinal labels -->
+        <g id="ticks"></g>
+
+        <!-- Target needle (blue) -->
+        <g id="needle-target">
+          <!-- Shaft -->
+          <line x1="120" y1="120" x2="120" y2="18" stroke="#00b4d8" stroke-width="3" stroke-linecap="round"/>
+          <!-- Arrowhead -->
+          <polygon points="120,10 114,26 126,26" fill="#00b4d8"/>
+          <!-- Tail -->
+          <line x1="120" y1="120" x2="120" y2="148" stroke="#00b4d8" stroke-width="2" opacity="0.5"/>
+        </g>
+
+        <!-- Current needle (orange) -->
+        <g id="needle-current">
+          <line x1="120" y1="120" x2="120" y2="28" stroke="#f77f00" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+          <polygon points="120,20 115,34 125,34" fill="#f77f00" opacity="0.85"/>
+          <line x1="120" y1="120" x2="120" y2="144" stroke="#f77f00" stroke-width="1.5" opacity="0.4"/>
+        </g>
+
+        <!-- Centre dot -->
+        <circle cx="120" cy="120" r="6" fill="#0d1b2a" stroke="#4a6480" stroke-width="2"/>
+      </svg>
+    </div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#00b4d8"></div>
+        Target
+      </div>
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#f77f00"></div>
+        Current
+      </div>
+    </div>
+
+    <!-- Angle readouts -->
+    <div class="readouts">
+      <div class="readout">
+        <div class="readout-label">Target</div>
+        <div class="readout-value target" id="target-display">0.0<span class="readout-unit">°</span></div>
+      </div>
+      <div class="readout">
+        <div class="readout-label">Current</div>
+        <div class="readout-value current" id="current-display">—<span class="readout-unit">°</span></div>
+      </div>
+    </div>
+
+    <!-- Angle slider -->
+    <div class="slider-section">
+      <div class="slider-row">
+        <span class="slider-label">0°</span>
+        <input type="range" id="angle-slider" min="0" max="360" step="0.5" value="0" />
+        <span class="slider-label">360°</span>
+      </div>
+    </div>
+
+    <!-- Preset angles -->
+    <div class="presets">
+      <button class="preset-btn" onclick="setAngle(0)">0°</button>
+      <button class="preset-btn" onclick="setAngle(45)">45°</button>
+      <button class="preset-btn" onclick="setAngle(90)">90°</button>
+      <button class="preset-btn" onclick="setAngle(135)">135°</button>
+      <button class="preset-btn" onclick="setAngle(180)">180°</button>
+      <button class="preset-btn" onclick="setAngle(225)">225°</button>
+      <button class="preset-btn" onclick="setAngle(270)">270°</button>
+      <button class="preset-btn" onclick="setAngle(315)">315°</button>
+    </div>
+
+  </div><!-- /card -->
+
+  <script>
+    // ── Build compass tick marks and cardinal labels ──────────────────────
+    (function buildTicks() {
+      const g = document.getElementById('ticks');
+      const cx = 120, cy = 120, r = 108;
+      const cardinals = { 0:'N', 90:'E', 180:'S', 270:'W' };
+      for (let deg = 0; deg < 360; deg += 5) {
+        const rad = (deg - 90) * Math.PI / 180;
+        const isMajor = deg % 45 === 0;
+        const isCardinal = deg % 90 === 0;
+        const inner = isCardinal ? r - 18 : (isMajor ? r - 12 : r - 7);
+        const x1 = cx + Math.cos(rad) * r;
+        const y1 = cy + Math.sin(rad) * r;
+        const x2 = cx + Math.cos(rad) * inner;
+        const y2 = cy + Math.sin(rad) * inner;
+        const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+        line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+        line.setAttribute('stroke', isCardinal ? '#4a8caa' : (isMajor ? '#2a5068' : '#1e3a50'));
+        line.setAttribute('stroke-width', isCardinal ? 2 : (isMajor ? 1.5 : 1));
+        g.appendChild(line);
+        if (isCardinal) {
+          const lx = cx + Math.cos(rad) * (inner - 10);
+          const ly = cy + Math.sin(rad) * (inner - 10);
+          const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+          txt.setAttribute('x', lx); txt.setAttribute('y', ly);
+          txt.setAttribute('text-anchor','middle');
+          txt.setAttribute('dominant-baseline','middle');
+          txt.setAttribute('fill','#6aaccc');
+          txt.setAttribute('font-size','11');
+          txt.setAttribute('font-weight','bold');
+          txt.textContent = cardinals[deg];
+          g.appendChild(txt);
+        }
+      }
+    })();
+
+    // ── State ─────────────────────────────────────────────────────────────
+    let targetAngle  = 0;
+    let currentAngle = 0;
+    let ws;
+    let reconnectTimer = null;
+
+    // ── DOM refs ──────────────────────────────────────────────────────────
+    const slider         = document.getElementById('angle-slider');
+    const targetDisplay  = document.getElementById('target-display');
+    const currentDisplay = document.getElementById('current-display');
+    const needleTarget   = document.getElementById('needle-target');
+    const needleCurrent  = document.getElementById('needle-current');
+    const statusDot      = document.getElementById('status-dot');
+    const statusText     = document.getElementById('status-text');
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    function setNeedleAngle(el, deg) {
+      el.style.transform = `rotate(${deg}deg)`;
+    }
+
+    function updateUI(target, current) {
+      // Clamp target to [0,360) for display
+      target  = ((target  % 360) + 360) % 360;
+      current = ((current % 360) + 360) % 360;
+      targetDisplay.innerHTML  = target.toFixed(1)  + '<span class="readout-unit">°</span>';
+      currentDisplay.innerHTML = current.toFixed(1) + '<span class="readout-unit">°</span>';
+      setNeedleAngle(needleTarget,  target);
+      setNeedleAngle(needleCurrent, current);
+    }
+
+    function sendAngle(deg) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ angle: deg }));
+      }
+    }
+
+    function setAngle(deg) {
+      deg = Math.max(0, Math.min(360, deg));
+      targetAngle = deg;
+      slider.value = deg;
+      updateUI(deg, currentAngle);
+      sendAngle(deg);
+    }
+
+    // ── Slider ────────────────────────────────────────────────────────────
+    slider.addEventListener('input', function () {
+      const deg = parseFloat(this.value);
+      targetAngle = deg;
+      updateUI(deg, currentAngle);
+    });
+    slider.addEventListener('change', function () {
+      sendAngle(parseFloat(this.value));
+    });
+
+    // ── WebSocket ─────────────────────────────────────────────────────────
+    function connect() {
+      const host = window.location.hostname;
+      ws = new WebSocket('ws://' + host + '/ws');
+
+      ws.onopen = function () {
+        statusDot.classList.add('connected');
+        statusText.textContent = 'Connected';
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      };
+
+      ws.onclose = function () {
+        statusDot.classList.remove('connected');
+        statusText.textContent = 'Disconnected – reconnecting…';
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = function () {
+        ws.close();
+      };
+
+      ws.onmessage = function (evt) {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.current !== undefined) currentAngle = data.current;
+          if (data.target  !== undefined) {
+            targetAngle  = data.target;
+            slider.value = targetAngle;
+          }
+          updateUI(targetAngle, currentAngle);
+        } catch (e) {
+          console.warn('Failed to parse WS message:', evt.data);
+        }
+      };
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────
+    updateUI(0, 0);
+    connect();
+  </script>
+</body>
+</html>
