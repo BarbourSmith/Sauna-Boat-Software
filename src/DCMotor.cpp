@@ -77,13 +77,13 @@ void DCMotor::runAtSpeed(uint8_t direction, uint16_t speed) {
 }
 
 void DCMotor::stop() {
-    ledcWrite(_channel1, 0);
-    ledcWrite(_channel2, 0);
+    ledcWrite(_forward, 0);
+    ledcWrite(_back, 0);
 }
 
 void DCMotor::highZ() {
-    ledcWrite(_channel1, 0);
-    ledcWrite(_channel2, 0);
+    ledcWrite(_forward, 0);
+    ledcWrite(_back, 0);
 }
 
 double DCMotor::readCurrent() {
