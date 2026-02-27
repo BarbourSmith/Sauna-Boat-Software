@@ -1,0 +1,191 @@
+// main.cpp – Sauna Boat Auto Steering System
+// ESP32-S3 firmware for the Maslow 4 control board
+//
+// Hardware: Bottom-Right motor port on Maslow 4 board
+//   Motor forward pin : GPIO 9  (brIn1Pin)
+//   Motor backward pin: GPIO 3  (brIn2Pin)
+//   Current sense pin : GPIO 7  (brADCPin)
+//   Encoder I2C mux ch: 0       (BREncoderLine)
+//   LEDC PWM channel 1: 6       (brIn1Channel)
+//   LEDC PWM channel 2: 7       (brIn2Channel)
+//   I2C SDA           : GPIO 5
+//   I2C SCL           : GPIO 4
+//   I2C speed         : 200 kHz
+//   I2C Mux address   : 0x70
+//
+// Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
+// Then open http://192.168.4.1 in a browser.
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <LittleFS.h>
+#include "MotorUnit.h"
+#include "SparkFun_I2C_Mux_Arduino_Library.h"
+
+// ---------------------------------------------------------------------------
+// WiFi Access Point credentials
+// ---------------------------------------------------------------------------
+static const char* AP_SSID = "SaunaBoatSteering";
+static const char* AP_PASS = "12345678";
+
+// ---------------------------------------------------------------------------
+// Maslow 4 board pin definitions – Bottom-Right motor port
+// ---------------------------------------------------------------------------
+#define I2C_SDA_PIN       5
+#define I2C_SCL_PIN       4
+#define I2C_FREQ_HZ       200000
+#define I2C_MUX_ADDR      0x70
+
+#define BR_FORWARD_PIN    9    // brIn1Pin
+#define BR_BACKWARD_PIN   3    // brIn2Pin
+#define BR_ADC_PIN        7    // brADCPin
+#define BR_ENCODER_CH     0    // BREncoderLine
+#define BR_PWM_CHANNEL1   6    // brIn1Channel
+#define BR_PWM_CHANNEL2   7    // brIn2Channel
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+static QWIICMUX    i2cMux;
+static MotorUnit   steeringMotor;
+static AsyncWebServer server(80);
+static AsyncWebSocket ws("/ws");
+
+// ---------------------------------------------------------------------------
+// WebSocket event handler
+// ---------------------------------------------------------------------------
+static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
+                      AwsEventType type, void* arg, uint8_t* data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+        Serial.printf("[WS] Client #%u connected from %s\n",
+                      client->id(), client->remoteIP().toString().c_str());
+        // Send current state immediately on connect
+        float current = steeringMotor.getCurrentAngle();
+        float target  = steeringMotor.getTargetAngle();
+        String msg = "{\"current\":" + String(current, 1)
+                   + ",\"target\":"  + String(target, 1) + "}";
+        client->text(msg);
+
+    } else if (type == WS_EVT_DISCONNECT) {
+        Serial.printf("[WS] Client #%u disconnected\n", client->id());
+
+    } else if (type == WS_EVT_DATA) {
+        AwsFrameInfo* info = reinterpret_cast<AwsFrameInfo*>(arg);
+        // Only handle complete, single-frame text messages
+        if (info->final && info->index == 0 && info->len == len
+                && info->opcode == WS_TEXT) {
+            // Copy to a null-terminated String to avoid out-of-bounds write on data[]
+            String msg(reinterpret_cast<const char*>(data), len);
+
+            // Parse simple JSON: {"angle":180.0}
+            int idx = msg.indexOf("\"angle\":");
+            if (idx >= 0) {
+                float angle = msg.substring(idx + 8).toFloat();
+                angle = constrain(angle, 0.0f, 360.0f);
+                steeringMotor.setTargetAngle(angle);
+                Serial.printf("[WS] New target angle: %.1f\xC2\xB0\n", angle);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast current and target angles to all connected WebSocket clients
+// ---------------------------------------------------------------------------
+static void broadcastStatus() {
+    if (ws.count() == 0) return;
+    float current = steeringMotor.getCurrentAngle();
+    float target  = steeringMotor.getTargetAngle();
+    String msg = "{\"current\":" + String(current, 1)
+               + ",\"target\":"  + String(target, 1) + "}";
+    ws.textAll(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Arduino setup
+// ---------------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n=== Sauna Boat Auto Steering System ===");
+
+    // --- I2C bus ---
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
+    Wire.setTimeOut(10);
+
+    // --- I2C Multiplexer (TCA9548A on Maslow 4 board) ---
+    if (!i2cMux.begin(I2C_MUX_ADDR, Wire)) {
+        Serial.println("[Setup] WARNING: I2C Mux not found – check wiring.");
+    } else {
+        Serial.println("[Setup] I2C Mux connected.");
+    }
+
+    // --- Steering motor (Bottom-Right port) ---
+    steeringMotor.begin(BR_FORWARD_PIN, BR_BACKWARD_PIN, BR_ADC_PIN,
+                        BR_ENCODER_CH, BR_PWM_CHANNEL1, BR_PWM_CHANNEL2,
+                        i2cMux);
+
+    // --- LittleFS (stores index.html) ---
+    if (!LittleFS.begin(true)) {
+        Serial.println("[Setup] ERROR: LittleFS mount failed!");
+    } else {
+        Serial.println("[Setup] LittleFS mounted.");
+    }
+
+    // --- WiFi Access Point ---
+    WiFi.softAP(AP_SSID, AP_PASS);
+    IPAddress ip = WiFi.softAPIP();
+    Serial.printf("[Setup] WiFi AP \"%s\" started.\n", AP_SSID);
+    Serial.printf("[Setup] Open http://%s in your browser.\n", ip.toString().c_str());
+
+    // --- WebSocket ---
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
+    // --- HTTP routes ---
+    // Serve the web UI
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->send(LittleFS, "/index.html", "text/html");
+    });
+
+    // JSON status endpoint for polling clients
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+        float current = steeringMotor.getCurrentAngle();
+        float target  = steeringMotor.getTargetAngle();
+        String json = "{\"current\":" + String(current, 1)
+                    + ",\"target\":"  + String(target, 1) + "}";
+        request->send(200, "application/json", json);
+    });
+
+    server.begin();
+    Serial.println("[Setup] HTTP server started.");
+}
+
+// ---------------------------------------------------------------------------
+// Arduino loop
+// ---------------------------------------------------------------------------
+void loop() {
+    // Update encoder reading (~100 Hz is sufficient for steering)
+    steeringMotor.updateEncoderPosition();
+
+    // Run PID and drive motor
+    steeringMotor.recomputePID();
+
+    // Broadcast angle data to WebSocket clients every 100 ms
+    static unsigned long lastBroadcast = 0;
+    if (millis() - lastBroadcast >= 100) {
+        lastBroadcast = millis();
+        broadcastStatus();
+    }
+
+    // Periodically clean up disconnected WebSocket clients
+    static unsigned long lastCleanup = 0;
+    if (millis() - lastCleanup >= 1000) {
+        lastCleanup = millis();
+        ws.cleanupClients();
+    }
+
+    delay(10);  // ~100 Hz control loop
+}
