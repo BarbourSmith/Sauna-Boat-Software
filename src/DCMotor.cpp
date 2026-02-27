@@ -22,13 +22,11 @@ void DCMotor::begin(uint8_t forwardPin, uint8_t backwardPin, int readbackPin, in
     _channel1 = channel1;
     _channel2 = channel2;
 
-    ledcSetup(_channel1, motorPWMFreq, motorPWMRes);
-    ledcAttachPin(_forward, _channel1);
-    ledcWrite(_channel1, 0);
+    ledcAttach(_forward, motorPWMFreq, motorPWMRes);
+    ledcWrite(_forward, 0);
 
-    ledcSetup(_channel2, motorPWMFreq, motorPWMRes);
-    ledcAttachPin(_back, _channel2);
-    ledcWrite(_channel2, 0);
+    ledcAttach(_back, motorPWMFreq, motorPWMRes);
+    ledcWrite(_back, 0);
 }
 
 void DCMotor::forward(uint16_t speed) {
@@ -70,11 +68,11 @@ void DCMotor::runAtPWM(long signed_speed) {
 
 void DCMotor::runAtSpeed(uint8_t direction, uint16_t speed) {
     if (direction == 0) {
-        ledcWrite(_channel1, _maxSpeed);
-        ledcWrite(_channel2, _maxSpeed - speed);
+        ledcWrite(_forward, _maxSpeed);
+        ledcWrite(_back, _maxSpeed - speed);
     } else {
-        ledcWrite(_channel2, _maxSpeed);
-        ledcWrite(_channel1, _maxSpeed - speed);
+        ledcWrite(_back, _maxSpeed);
+        ledcWrite(_forward, _maxSpeed - speed);
     }
 }
 
