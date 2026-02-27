@@ -15,14 +15,13 @@
 // PID gains – tune these for your motor/load combination.
 // Kp: proportional gain; higher = faster response but may overshoot.
 // Ki: integral gain; eliminates steady-state error.
-// Kd: set to zero to avoid amplifying high-frequency encoder noise;
-//     increase only if overshoot is observed with a well-filtered encoder.
-#define STEERING_KP 2.5f
-#define STEERING_KI 0.01f
-#define STEERING_KD 0.0f
+// Kd: derivative gain; helps dampen oscillation.
+#define STEERING_KP 3.5f
+#define STEERING_KI 0.005f
+#define STEERING_KD 0.3f
 
 // Motor stops when angle error is within this deadband (degrees).
-#define ANGLE_DEADBAND_DEG 0.5f
+#define ANGLE_DEADBAND_DEG 3.0f
 
 class MotorUnit {
 public:

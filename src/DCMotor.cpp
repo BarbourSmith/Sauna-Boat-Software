@@ -54,7 +54,7 @@ void DCMotor::halfIn() {
 
 void DCMotor::runAtPWM(long signed_speed) {
     //Motor driver accepts -maxPWMvalue to maxPWMvalue but doesn't begin moving until motorStartsToMovePWM so we scale
-    int  motorStartsToMovePWM = 75;
+    int  motorStartsToMovePWM = 0;
     int  maxPWMvalue          = 1023;
     long scaledSpeed          = map(abs(signed_speed), 0, maxPWMvalue, motorStartsToMovePWM, _maxSpeed);
 

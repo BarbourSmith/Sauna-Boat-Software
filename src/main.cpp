@@ -38,8 +38,8 @@ static const char* AP_PASS = "12345678";
 #define I2C_FREQ_HZ       200000
 #define I2C_MUX_ADDR      0x70
 
-#define BR_FORWARD_PIN    9    // brIn1Pin
-#define BR_BACKWARD_PIN   3    // brIn2Pin
+#define BR_FORWARD_PIN    3    // brIn2Pin (swapped: motor wires are inverse to encoder direction)
+#define BR_BACKWARD_PIN   9    // brIn1Pin (swapped: motor wires are inverse to encoder direction)
 #define BR_ADC_PIN        7    // brADCPin
 #define BR_ENCODER_CH     0    // BREncoderLine
 #define BR_PWM_CHANNEL1   6    // brIn1Channel

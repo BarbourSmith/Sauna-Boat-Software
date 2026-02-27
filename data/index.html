@@ -18,6 +18,14 @@
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
+    /* Prevent accidental text selection during swipe gestures */
+    body, .card, .readouts, .readout, .legend, .presets, header, #status-bar {
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    /* Keep text selectable only on elements that need it */
+    input[type="range"] { -webkit-user-select: auto; user-select: auto; }
+
     body {
       font-family: 'Segoe UI', Arial, sans-serif;
       background: var(--bg);
@@ -28,22 +36,6 @@
       align-items: center;
       padding: 24px 16px 40px;
       gap: 24px;
-    }
-
-    /* ── Header ── */
-    header {
-      text-align: center;
-    }
-    header h1 {
-      font-size: 1.6rem;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      color: var(--accent);
-    }
-    header p {
-      font-size: 0.85rem;
-      color: var(--subtext);
-      margin-top: 4px;
     }
 
     /* ── Status pill ── */
@@ -173,29 +165,6 @@
       cursor: pointer;
     }
 
-    /* ── Preset buttons ── */
-    .presets {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
-    .preset-btn {
-      background: #1e3448;
-      border: 1px solid #2a4a6a;
-      color: var(--text);
-      border-radius: 8px;
-      padding: 6px 14px;
-      font-size: 0.82rem;
-      cursor: pointer;
-      transition: background 0.2s, border-color 0.2s;
-    }
-    .preset-btn:hover {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: var(--bg);
-    }
-
     /* ── Legend ── */
     .legend {
       display: flex;
@@ -216,12 +185,6 @@
   </style>
 </head>
 <body>
-
-  <!-- Header -->
-  <header>
-    <h1>⛵ Auto Steering</h1>
-    <p>Maslow 4 Boat Control System</p>
-  </header>
 
   <!-- Connection status -->
   <div id="status-bar">
@@ -295,17 +258,6 @@
       </div>
     </div>
 
-    <!-- Preset angles -->
-    <div class="presets">
-      <button class="preset-btn" onclick="setAngle(0)">0°</button>
-      <button class="preset-btn" onclick="setAngle(45)">45°</button>
-      <button class="preset-btn" onclick="setAngle(90)">90°</button>
-      <button class="preset-btn" onclick="setAngle(135)">135°</button>
-      <button class="preset-btn" onclick="setAngle(180)">180°</button>
-      <button class="preset-btn" onclick="setAngle(225)">225°</button>
-      <button class="preset-btn" onclick="setAngle(270)">270°</button>
-      <button class="preset-btn" onclick="setAngle(315)">315°</button>
-    </div>
 
   </div><!-- /card -->
 
@@ -362,18 +314,27 @@
     const statusText     = document.getElementById('status-text');
 
     // ── Helpers ───────────────────────────────────────────────────────────
-    function setNeedleAngle(el, deg) {
-      el.style.transform = `rotate(${deg}deg)`;
+    // Track continuous (unbounded) needle angles so CSS transitions always
+    // take the short path across the 0/360 boundary.
+    let needleTargetDeg  = 0;
+    let needleCurrentDeg = 0;
+
+    function setNeedleAngle(el, prevDeg, newRawDeg) {
+      // Find the shortest delta from the previous continuous angle
+      let delta = ((newRawDeg - prevDeg) % 360 + 540) % 360 - 180;
+      const continuous = prevDeg + delta;
+      el.style.transform = `rotate(${continuous}deg)`;
+      return continuous;
     }
 
     function updateUI(target, current) {
-      // Clamp target to [0,360) for display
+      // Normalise to [0, 360) for display and raw needle input
       target  = ((target  % 360) + 360) % 360;
       current = ((current % 360) + 360) % 360;
       targetDisplay.innerHTML  = target.toFixed(1)  + '<span class="readout-unit">°</span>';
       currentDisplay.innerHTML = current.toFixed(1) + '<span class="readout-unit">°</span>';
-      setNeedleAngle(needleTarget,  target);
-      setNeedleAngle(needleCurrent, current);
+      needleTargetDeg  = setNeedleAngle(needleTarget,  needleTargetDeg,  target);
+      needleCurrentDeg = setNeedleAngle(needleCurrent, needleCurrentDeg, current);
     }
 
     function sendAngle(deg) {
@@ -439,6 +400,74 @@
     // ── Init ──────────────────────────────────────────────────────────────
     updateUI(0, 0);
     connect();
+
+    // ── Whole-screen swipe to adjust angle ────────────────────────────────
+    // Swiping left/right anywhere on the page nudges the target angle.
+    (function setupSwipe() {
+      const PIXELS_PER_DEGREE = 3; // px of horizontal swipe = 1 degree
+      let touchStartX = null;
+      let lastSentX   = null;
+
+      document.addEventListener('touchstart', function (e) {
+        // Ignore touches directly on the slider (let it handle itself)
+        if (e.target === slider) return;
+        touchStartX = e.touches[0].clientX;
+        lastSentX   = touchStartX;
+      }, { passive: true });
+
+      document.addEventListener('touchmove', function (e) {
+        if (touchStartX === null) return;
+        if (e.target === slider) return;
+        const x     = e.touches[0].clientX;
+        const delta = (x - lastSentX) / PIXELS_PER_DEGREE;
+        if (Math.abs(delta) >= 1) {
+          const newAngle = ((targetAngle + delta) % 360 + 360) % 360;
+          targetAngle  = newAngle;
+          slider.value = newAngle;
+          updateUI(newAngle, currentAngle);
+          sendAngle(newAngle);
+          lastSentX = x;
+        }
+      }, { passive: true });
+
+      document.addEventListener('touchend', function () {
+        touchStartX = null;
+        lastSentX   = null;
+      }, { passive: true });
+    })();
+
+    // ── Prevent phone screen from sleeping ───────────────────────────────
+    // Uses a silent looping video (the only approach that works on HTTP,
+    // which is what the ESP32 serves - Wake Lock API requires HTTPS).
+    (function noSleep() {
+      const v = document.createElement('video');
+      // Both attribute AND property required for reliable muting across browsers
+      v.setAttribute('playsinline', '');
+      v.setAttribute('webkit-playsinline', '');
+      v.setAttribute('muted', '');
+      v.setAttribute('loop', '');
+      v.muted  = true;
+      v.volume = 0;
+      // Must not be display:none or opacity:0 — iOS won't play invisible video.
+      // Position off-screen so it is technically visible but not seen.
+      v.style.cssText = 'position:fixed;top:-2px;left:-2px;width:2px;height:2px;pointer-events:none;';
+      v.src = 'data:video/mp4;base64,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';
+      document.body.appendChild(v);
+
+      function tryPlay() { v.play().catch(function(){}); }
+
+      // Start on first touch (browsers require a user gesture before autoplay)
+      document.addEventListener('touchstart', tryPlay, { passive: true, once: true });
+
+      // If the video stops for any reason, restart it
+      v.addEventListener('pause', tryPlay);
+      v.addEventListener('ended', tryPlay);
+
+      // Re-attempt when page becomes visible (e.g. returning from another app)
+      document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible') tryPlay();
+      });
+    })();
   </script>
 </body>
 </html>
