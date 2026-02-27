@@ -125,6 +125,11 @@ double MotorUnit::recomputePID() {
                  + STEERING_KD * derivative;
     output = constrain(output, -1023.0f, 1023.0f);
 
+    static unsigned long _lastPIDLog = 0;
+    if (millis() - _lastPIDLog >= 500) {
+        _lastPIDLog = millis();
+        Serial.printf("[PID] error=%.1f output=%.0f\n", error, output);
+    }
     _motor.runAtPWM(static_cast<long>(output));
     return static_cast<double>(output);
 }

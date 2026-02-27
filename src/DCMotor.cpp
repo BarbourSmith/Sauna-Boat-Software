@@ -22,11 +22,14 @@ void DCMotor::begin(uint8_t forwardPin, uint8_t backwardPin, int readbackPin, in
     _channel1 = channel1;
     _channel2 = channel2;
 
-    ledcAttach(_forward, motorPWMFreq, motorPWMRes);
-    ledcWrite(_forward, 0);
+    //Setup the motor controllers
+    ledcSetup(channel1, motorPWMFreq, motorPWMRes);  // configure PWM functionalities...this uses timer 0 (channel, freq, resolution)
+    ledcAttachPin(_forward, channel1);               // attach the channel to the GPIO to be controlled
+    ledcWrite(channel1, 0);                          //Turn the motor off
 
-    ledcAttach(_back, motorPWMFreq, motorPWMRes);
-    ledcWrite(_back, 0);
+    ledcSetup(channel2, motorPWMFreq, motorPWMRes);
+    ledcAttachPin(_back, channel2);
+    ledcWrite(channel2, 0);
 }
 
 void DCMotor::forward(uint16_t speed) {
@@ -50,11 +53,7 @@ void DCMotor::halfIn() {
 }
 
 void DCMotor::runAtPWM(long signed_speed) {
-    if (signed_speed == 0) {
-        stop();
-        return;
-    }
-
+    //Motor driver accepts -maxPWMvalue to maxPWMvalue but doesn't begin moving until motorStartsToMovePWM so we scale
     int  motorStartsToMovePWM = 75;
     int  maxPWMvalue          = 1023;
     long scaledSpeed          = map(abs(signed_speed), 0, maxPWMvalue, motorStartsToMovePWM, _maxSpeed);
@@ -68,22 +67,24 @@ void DCMotor::runAtPWM(long signed_speed) {
 
 void DCMotor::runAtSpeed(uint8_t direction, uint16_t speed) {
     if (direction == 0) {
-        ledcWrite(_forward, _maxSpeed);
-        ledcWrite(_back, _maxSpeed - speed);
+        ledcWrite(_channel1, _maxSpeed);
+        ledcWrite(_channel2, _maxSpeed - speed);
+
     } else {
-        ledcWrite(_back, _maxSpeed);
-        ledcWrite(_forward, _maxSpeed - speed);
+        ledcWrite(_channel2, _maxSpeed);
+        ledcWrite(_channel1, _maxSpeed - speed);
     }
 }
 
 void DCMotor::stop() {
-    ledcWrite(_forward, 0);
-    ledcWrite(_back, 0);
+    //These could be set to 1023 to allow coasting
+    ledcWrite(_channel1, 0);  //Stop
+    ledcWrite(_channel2, 0);
 }
 
 void DCMotor::highZ() {
-    ledcWrite(_forward, 0);
-    ledcWrite(_back, 0);
+    ledcWrite(_channel1, 0);  //Stop
+    ledcWrite(_channel2, 0);
 }
 
 double DCMotor::readCurrent() {

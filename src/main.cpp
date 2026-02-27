@@ -126,6 +126,15 @@ void setup() {
     steeringMotor.begin(BR_FORWARD_PIN, BR_BACKWARD_PIN, BR_ADC_PIN,
                         BR_ENCODER_CH, BR_PWM_CHANNEL1, BR_PWM_CHANNEL2,
                         i2cMux);
+    Serial.printf("[Setup] Encoder connected: %s\n",
+                  steeringMotor.isEncoderConnected() ? "YES" : "NO");
+    Serial.printf("[Setup] Magnet detected:   %s\n",
+                  steeringMotor.hasMagnet() ? "YES" : "NO");
+    if (steeringMotor.updateEncoderPosition()) {
+        Serial.printf("[Setup] Initial angle: %.1f deg\n", steeringMotor.getCurrentAngle());
+    } else {
+        Serial.println("[Setup] WARNING: Could not read encoder angle on startup!");
+    }
 
     // --- LittleFS (stores index.html) ---
     if (!LittleFS.begin(true)) {
@@ -168,10 +177,25 @@ void setup() {
 // ---------------------------------------------------------------------------
 void loop() {
     // Update encoder reading (~100 Hz is sufficient for steering)
-    steeringMotor.updateEncoderPosition();
+    bool encoderOk = steeringMotor.updateEncoderPosition();
 
-    // Run PID and drive motor
-    steeringMotor.recomputePID();
+    // Periodically log diagnostics to serial for debugging
+    static unsigned long lastDiag = 0;
+    if (millis() - lastDiag >= 500) {
+        lastDiag = millis();
+        Serial.printf("[Loop] encoder=%s current=%.1f target=%.1f motorCurrent=%.0f\n",
+                      encoderOk ? "OK" : "FAIL",
+                      steeringMotor.getCurrentAngle(),
+                      steeringMotor.getTargetAngle(),
+                      steeringMotor.getMotorCurrent());
+    }
+
+    // Only run PID if the encoder is responding; otherwise stop the motor
+    if (encoderOk) {
+        steeringMotor.recomputePID();
+    } else {
+        steeringMotor.stop();
+    }
 
     // Broadcast angle data to WebSocket clients every 100 ms
     static unsigned long lastBroadcast = 0;
