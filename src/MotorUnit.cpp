@@ -80,6 +80,16 @@ double MotorUnit::getMotorCurrent() {
     return _motor.readCurrent();
 }
 
+void MotorUnit::setKp(float kp)             { _kp       = kp; }
+void MotorUnit::setKi(float ki)             { _ki       = ki; }
+void MotorUnit::setKd(float kd)             { _kd       = kd; }
+void MotorUnit::setDeadband(float deadband) { _deadband = deadband; }
+
+float MotorUnit::getKp()       const { return _kp; }
+float MotorUnit::getKi()       const { return _ki; }
+float MotorUnit::getKd()       const { return _kd; }
+float MotorUnit::getDeadband() const { return _deadband; }
+
 void MotorUnit::stop() {
     _motor.stop();
     _integral  = 0.0f;
@@ -98,7 +108,7 @@ double MotorUnit::recomputePID() {
     float error = _computeWrappedError();
 
     // Within the deadband: stop and reset integrator to prevent hunting
-    if (fabsf(error) < ANGLE_DEADBAND_DEG) {
+    if (fabsf(error) < _deadband) {
         _motor.stop();
         _integral  = 0.0f;
         _lastError = 0.0f;
@@ -120,9 +130,9 @@ double MotorUnit::recomputePID() {
     _lastError = error;
 
     // PID output in PWM range [-1023, 1023]
-    float output = STEERING_KP * error
-                 + STEERING_KI * _integral
-                 + STEERING_KD * derivative;
+    float output = _kp * error
+                 + _ki * _integral
+                 + _kd * derivative;
     output = constrain(output, -1023.0f, 1023.0f);
 
     static unsigned long _lastPIDLog = 0;

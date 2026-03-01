@@ -21,6 +21,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include "MotorUnit.h"
 #include "SparkFun_I2C_Mux_Arduino_Library.h"
 
@@ -52,6 +53,14 @@ static QWIICMUX    i2cMux;
 static MotorUnit   steeringMotor;
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
+static Preferences prefs;
+
+// North-trim offset (degrees): the raw encoder angle that maps to heading 0°.
+// Applied client-side for display; persisted here so the browser can reload it.
+static float g_northTrim = 0.0f;
+
+// Accumulation buffer for POST /settings request body
+static String g_settingsBody;
 
 // ---------------------------------------------------------------------------
 // WebSocket event handler
@@ -143,6 +152,17 @@ void setup() {
         Serial.println("[Setup] LittleFS mounted.");
     }
 
+    // --- NVS: load persisted settings ---
+    prefs.begin("steering", false);
+    steeringMotor.setKp(      prefs.getFloat("kp",       3.5f));
+    steeringMotor.setKi(      prefs.getFloat("ki",       0.005f));
+    steeringMotor.setKd(      prefs.getFloat("kd",       0.3f));
+    steeringMotor.setDeadband(prefs.getFloat("deadband", 3.0f));
+    g_northTrim = prefs.getFloat("northTrim", 0.0f);
+    Serial.printf("[Setup] Settings loaded – Kp=%.3f Ki=%.4f Kd=%.3f deadband=%.1f northTrim=%.1f\n",
+                  steeringMotor.getKp(), steeringMotor.getKi(),
+                  steeringMotor.getKd(), steeringMotor.getDeadband(), g_northTrim);
+
     // --- WiFi Access Point ---
     WiFi.softAP(AP_SSID, AP_PASS);
     IPAddress ip = WiFi.softAPIP();
@@ -167,6 +187,58 @@ void setup() {
                     + ",\"target\":"  + String(target, 1) + "}";
         request->send(200, "application/json", json);
     });
+
+    // GET /settings – returns all tunable parameters as JSON
+    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String json = "{\"kp\":"        + String(steeringMotor.getKp(),       3)
+                    + ",\"ki\":"        + String(steeringMotor.getKi(),       4)
+                    + ",\"kd\":"        + String(steeringMotor.getKd(),       3)
+                    + ",\"deadband\":"+  String(steeringMotor.getDeadband(),  1)
+                    + ",\"northTrim\":" + String(g_northTrim,                 1)
+                    + "}";
+        request->send(200, "application/json", json);
+    });
+
+    // POST /settings – accepts JSON body with any subset of the above fields
+    server.on("/settings", HTTP_POST,
+        [](AsyncWebServerRequest* request) {
+            // Parse fields from the accumulated body
+            auto parseField = [](const String& json, const char* key, float fallback) -> float {
+                String search = "\""; search += key; search += "\":";
+                int idx = json.indexOf(search);
+                if (idx < 0) return fallback;
+                return json.substring(idx + search.length()).toFloat();
+            };
+
+            float kp       = parseField(g_settingsBody, "kp",        steeringMotor.getKp());
+            float ki       = parseField(g_settingsBody, "ki",        steeringMotor.getKi());
+            float kd       = parseField(g_settingsBody, "kd",        steeringMotor.getKd());
+            float deadband = parseField(g_settingsBody, "deadband",  steeringMotor.getDeadband());
+            float northTrim= parseField(g_settingsBody, "northTrim", g_northTrim);
+
+            steeringMotor.setKp(kp);
+            steeringMotor.setKi(ki);
+            steeringMotor.setKd(kd);
+            steeringMotor.setDeadband(deadband);
+            g_northTrim = northTrim;
+
+            prefs.putFloat("kp",        kp);
+            prefs.putFloat("ki",        ki);
+            prefs.putFloat("kd",        kd);
+            prefs.putFloat("deadband",  deadband);
+            prefs.putFloat("northTrim", northTrim);
+
+            Serial.printf("[Settings] Saved – Kp=%.3f Ki=%.4f Kd=%.3f deadband=%.1f northTrim=%.1f\n",
+                          kp, ki, kd, deadband, northTrim);
+            request->send(200, "application/json", "{\"ok\":true}");
+        },
+        nullptr,  // upload handler (not needed)
+        [](AsyncWebServerRequest* /*request*/, uint8_t* data, size_t len,
+           size_t index, size_t /*total*/) {
+            if (index == 0) g_settingsBody = "";
+            g_settingsBody += String(reinterpret_cast<const char*>(data), len);
+        }
+    );
 
     server.begin();
     Serial.println("[Setup] HTTP server started.");
