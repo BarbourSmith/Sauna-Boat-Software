@@ -167,19 +167,22 @@
 
     /* ── Settings button ── */
     #settings-toggle {
-      background: var(--panel);
-      border: 1px solid #2a3f57;
-      border-radius: 999px;
-      color: var(--subtext);
+      background: #1e3a50;
+      border: 1px solid #2a5068;
+      border-radius: 10px;
+      color: var(--accent);
       cursor: pointer;
-      font-size: 0.82rem;
-      padding: 6px 14px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: color 0.2s, border-color 0.2s;
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 12px 20px;
+      width: 100%;
+      text-align: center;
+      transition: background 0.2s, border-color 0.2s;
     }
-    #settings-toggle:hover { color: var(--accent); border-color: var(--accent); }
+    #settings-toggle:hover, #settings-toggle:active {
+      background: #254a66;
+      border-color: var(--accent);
+    }
 
     /* ── Settings panel ── */
     #settings-panel {
@@ -262,13 +265,10 @@
 </head>
 <body>
 
-  <!-- Connection status + settings toggle -->
-  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center">
-    <div id="status-bar">
-      <div id="status-dot"></div>
-      <span id="status-text">Connecting…</span>
-    </div>
-    <button id="settings-toggle" onclick="toggleSettings()">⚙ Settings</button>
+  <!-- Connection status -->
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
   </div>
 
   <!-- Main card -->
@@ -337,6 +337,8 @@
       </div>
     </div>
 
+    <!-- Settings toggle button -->
+    <button id="settings-toggle" onclick="toggleSettings()">⚙ Settings</button>
 
   </div><!-- /card -->
 
