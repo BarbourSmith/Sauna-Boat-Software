@@ -12,17 +12,6 @@
 #include "DCMotor.h"
 #include "SparkFun_I2C_Mux_Arduino_Library.h"
 
-// PID gains – tune these for your motor/load combination.
-// Kp: proportional gain; higher = faster response but may overshoot.
-// Ki: integral gain; eliminates steady-state error.
-// Kd: derivative gain; helps dampen oscillation.
-#define STEERING_KP 3.5f
-#define STEERING_KI 0.005f
-#define STEERING_KD 0.3f
-
-// Motor stops when angle error is within this deadband (degrees).
-#define ANGLE_DEADBAND_DEG 3.0f
-
 class MotorUnit {
 public:
     // Initialise the motor unit using pins from the Maslow 4 bottom-right port.
@@ -64,6 +53,17 @@ public:
     // Returns the instantaneous motor current in ADC counts.
     double getMotorCurrent();
 
+    // Runtime-adjustable PID gains and deadband.
+    void  setKp(float kp);
+    void  setKi(float ki);
+    void  setKd(float kd);
+    void  setDeadband(float deadbandDeg);
+
+    float getKp()       const;
+    float getKi()       const;
+    float getKd()       const;
+    float getDeadband() const;
+
 private:
     // Compute the shortest-path error between target and current angle.
     // Result is in the range [-180, 180] degrees.
@@ -81,4 +81,10 @@ private:
     float         _integral    = 0.0f;
     float         _lastError   = 0.0f;
     unsigned long _lastPIDTime = 0;
+
+    // Runtime-configurable PID gains and deadband (default values match original defines)
+    float _kp       = 3.5f;
+    float _ki       = 0.005f;
+    float _kd       = 0.3f;
+    float _deadband = 3.0f;
 };

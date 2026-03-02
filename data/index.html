@@ -165,7 +165,83 @@
       cursor: pointer;
     }
 
-    /* ── Legend ── */
+    /* ── Settings button ── */
+    #settings-toggle {
+      background: var(--panel);
+      border: 1px solid #2a3f57;
+      border-radius: 999px;
+      color: var(--subtext);
+      cursor: pointer;
+      font-size: 0.82rem;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    #settings-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+    /* ── Settings panel ── */
+    #settings-panel {
+      width: 100%;
+      max-width: 420px;
+      display: none;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .settings-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .settings-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .settings-label {
+      font-size: 0.82rem;
+      color: var(--subtext);
+      flex: 1;
+    }
+    .settings-input {
+      width: 90px;
+      background: #0d1b2a;
+      border: 1px solid #2a3f57;
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+      padding: 6px 8px;
+      text-align: right;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .settings-input:focus { outline: none; border-color: var(--accent); }
+    .settings-divider {
+      height: 1px;
+      background: #2a3f57;
+    }
+    .btn-primary, .btn-secondary {
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      padding: 10px 20px;
+      transition: opacity 0.2s;
+      width: 100%;
+    }
+    .btn-primary  { background: var(--accent); color: #0d1b2a; font-weight: 700; }
+    .btn-secondary{ background: #2a3f57;       color: var(--text); }
+    .btn-primary:hover, .btn-secondary:hover { opacity: 0.85; }
+    .settings-actions { display: flex; gap: 10px; }
     .legend {
       display: flex;
       gap: 20px;
@@ -186,10 +262,13 @@
 </head>
 <body>
 
-  <!-- Connection status -->
-  <div id="status-bar">
-    <div id="status-dot"></div>
-    <span id="status-text">Connecting…</span>
+  <!-- Connection status + settings toggle -->
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center">
+    <div id="status-bar">
+      <div id="status-dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+    <button id="settings-toggle" onclick="toggleSettings()">⚙ Settings</button>
   </div>
 
   <!-- Main card -->
@@ -261,6 +340,49 @@
 
   </div><!-- /card -->
 
+  <!-- Settings panel -->
+  <div id="settings-panel" class="card">
+
+    <div class="settings-group">
+      <div class="settings-title">PID Controller</div>
+      <div class="settings-row">
+        <span class="settings-label">Kp (Proportional)</span>
+        <input type="number" id="kp-input" class="settings-input" step="0.1" min="0.1" max="100">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Ki (Integral)</span>
+        <input type="number" id="ki-input" class="settings-input" step="0.001" min="0" max="10">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Kd (Derivative)</span>
+        <input type="number" id="kd-input" class="settings-input" step="0.01" min="0" max="50">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Deadband (°)</span>
+        <input type="number" id="deadband-input" class="settings-input" step="0.5" min="0" max="45">
+      </div>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <div class="settings-group">
+      <div class="settings-title">North Trim</div>
+      <div class="settings-row">
+        <span class="settings-label">Trim Offset (°)</span>
+        <input type="number" id="north-trim-input" class="settings-input" step="0.1" min="0" max="360">
+      </div>
+      <button class="btn-secondary" onclick="setCurrentAsNorth()">Set Current Direction as North</button>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <div class="settings-actions">
+      <button class="btn-primary"   onclick="saveSettings()">Save</button>
+      <button class="btn-secondary" onclick="toggleSettings()">Cancel</button>
+    </div>
+
+  </div><!-- /settings-panel -->
+
   <script>
     // ── Build compass tick marks and cardinal labels ──────────────────────
     (function buildTicks() {
@@ -300,7 +422,9 @@
 
     // ── State ─────────────────────────────────────────────────────────────
     let targetAngle  = 0;
-    let currentAngle = 0;
+    let currentAngle = 0;   // display angle (trim-adjusted)
+    let rawCurrentAngle = 0;// raw angle from server (before trim)
+    let northTrim    = 0;   // trim offset loaded from /settings
     let ws;
     let reconnectTimer = null;
 
@@ -312,6 +436,16 @@
     const needleCurrent  = document.getElementById('needle-current');
     const statusDot      = document.getElementById('status-dot');
     const statusText     = document.getElementById('status-text');
+
+    // ── Trim helpers ──────────────────────────────────────────────────────
+    // Raw motor angle → display heading (subtract trim)
+    function applyTrim(rawDeg, trim) {
+      return ((rawDeg - trim) % 360 + 360) % 360;
+    }
+    // Display heading → raw motor angle (add trim back)
+    function removeTrim(displayDeg, trim) {
+      return ((displayDeg + trim) % 360 + 360) % 360;
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────
     // Track continuous (unbounded) needle angles so CSS transitions always
@@ -337,9 +471,11 @@
       needleCurrentDeg = setNeedleAngle(needleCurrent, needleCurrentDeg, current);
     }
 
-    function sendAngle(deg) {
+    function sendAngle(displayDeg) {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ angle: deg }));
+        // Convert display heading to raw motor angle before sending
+        const rawDeg = removeTrim(displayDeg, northTrim);
+        ws.send(JSON.stringify({ angle: rawDeg }));
       }
     }
 
@@ -385,9 +521,13 @@
       ws.onmessage = function (evt) {
         try {
           const data = JSON.parse(evt.data);
-          if (data.current !== undefined) currentAngle = data.current;
-          if (data.target  !== undefined) {
-            targetAngle  = data.target;
+          if (data.current !== undefined) {
+            rawCurrentAngle = data.current;
+            currentAngle = applyTrim(data.current, northTrim);
+          }
+          if (data.target !== undefined) {
+            // Convert raw motor target back to display angle for the slider
+            targetAngle  = applyTrim(data.target, northTrim);
             slider.value = targetAngle;
           }
           updateUI(targetAngle, currentAngle);
@@ -399,7 +539,63 @@
 
     // ── Init ──────────────────────────────────────────────────────────────
     updateUI(0, 0);
+    loadSettings();
     connect();
+
+    // ── Settings ──────────────────────────────────────────────────────────
+    function toggleSettings() {
+      const panel = document.getElementById('settings-panel');
+      const isOpen = panel.style.display === 'flex';
+      if (!isOpen) loadSettings();
+      panel.style.display = isOpen ? 'none' : 'flex';
+    }
+
+    function loadSettings() {
+      fetch('/settings')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('kp-input').value        = data.kp;
+          document.getElementById('ki-input').value        = data.ki;
+          document.getElementById('kd-input').value        = data.kd;
+          document.getElementById('deadband-input').value  = data.deadband;
+          document.getElementById('north-trim-input').value= data.northTrim;
+          // Apply the loaded trim to current display
+          northTrim    = parseFloat(data.northTrim) || 0;
+          currentAngle = applyTrim(rawCurrentAngle, northTrim);
+          updateUI(targetAngle, currentAngle);
+        })
+        .catch(function(e) { console.warn('Failed to load settings:', e); });
+    }
+
+    function saveSettings() {
+      const payload = {
+        kp:        parseFloat(document.getElementById('kp-input').value),
+        ki:        parseFloat(document.getElementById('ki-input').value),
+        kd:        parseFloat(document.getElementById('kd-input').value),
+        deadband:  parseFloat(document.getElementById('deadband-input').value),
+        northTrim: parseFloat(document.getElementById('north-trim-input').value)
+      };
+      fetch('/settings', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+      })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.ok) {
+            northTrim    = payload.northTrim;
+            currentAngle = applyTrim(rawCurrentAngle, northTrim);
+            updateUI(targetAngle, currentAngle);
+            document.getElementById('settings-panel').style.display = 'none';
+          }
+        })
+        .catch(function(e) { console.warn('Failed to save settings:', e); });
+    }
+
+    function setCurrentAsNorth() {
+      // Set the trim so that the current raw motor angle becomes heading 0°
+      document.getElementById('north-trim-input').value = rawCurrentAngle.toFixed(1);
+    }
 
     // ── Whole-screen swipe to adjust angle ────────────────────────────────
     // Swiping left/right anywhere on the page nudges the target angle.
