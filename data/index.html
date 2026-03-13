@@ -254,7 +254,7 @@
     const PUCK_RADIUS         = 35;    // half the 70 px puck
     const MAX_TRAVEL          = PAD_RADIUS - PUCK_RADIUS;   // 65 px
     const SEND_THROTTLE_MS    = 50;    // max send rate while dragging (20 Hz)
-    const HEARTBEAT_INTERVAL_MS = 500; // keep-alive send interval (ms)
+    const HEARTBEAT_INTERVAL_MS = 100; // keep-alive send interval (ms) — firmware watchdog is 200 ms
     const RECONNECT_DELAY_MS  = 3000;  // wait before reconnect attempt (ms)
     const SPEED_THRESHOLD     = 0.02;  // minimum speed to show direction label
 

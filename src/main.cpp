@@ -63,7 +63,8 @@ static float          g_currentSpeed = 0.0f;
 static unsigned long  g_lastCmdTime  = 0;
 
 // Motor stops if no speed command arrives within this window (milliseconds).
-static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 2000;
+// Set to 200 ms so the motor stops if even one 100 ms heartbeat is missed.
+static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
