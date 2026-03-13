@@ -151,8 +151,10 @@ void setup() {
     // --- NVS: load persisted settings ---
     prefs.begin("steering", false);
     steeringMotor.setMaxSpeed(prefs.getInt("maxSpeed", 512));
-    Serial.printf("[Setup] Settings loaded – maxSpeed=%d\n",
-                  steeringMotor.getMaxSpeed());
+    // snapTimeout is a UI-only value; the firmware just stores and serves it.
+    int snapTimeout = prefs.getInt("snapTimeout", 100);
+    Serial.printf("[Setup] Settings loaded – maxSpeed=%d snapTimeout=%d\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout);
 
     // --- WiFi Access Point ---
     WiFi.softAP(AP_SSID, AP_PASS);
@@ -172,7 +174,9 @@ void setup() {
 
     // GET /settings – returns all tunable parameters as JSON
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"maxSpeed\":" + String(steeringMotor.getMaxSpeed()) + "}";
+        String json = "{\"maxSpeed\":" + String(steeringMotor.getMaxSpeed())
+                    + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
+                    + "}";
         request->send(200, "application/json", json);
     });
 
@@ -191,10 +195,17 @@ void setup() {
                            static_cast<float>(steeringMotor.getMaxSpeed())));
             maxSpeed = constrain(maxSpeed, 0, 1023);
 
+            int snapTimeout = static_cast<int>(
+                parseField(g_settingsBody, "snapTimeout",
+                           static_cast<float>(prefs.getInt("snapTimeout", 100))));
+            snapTimeout = constrain(snapTimeout, 50, 5000);
+
             steeringMotor.setMaxSpeed(maxSpeed);
             prefs.putInt("maxSpeed", maxSpeed);
+            prefs.putInt("snapTimeout", snapTimeout);
 
-            Serial.printf("[Settings] Saved – maxSpeed=%d\n", maxSpeed);
+            Serial.printf("[Settings] Saved – maxSpeed=%d snapTimeout=%d\n",
+                          maxSpeed, snapTimeout);
             request->send(200, "application/json", "{\"ok\":true}");
         },
         nullptr,  // upload handler (not needed)

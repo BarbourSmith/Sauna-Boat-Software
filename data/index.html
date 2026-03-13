@@ -242,6 +242,15 @@
              style="margin-top:4px;" />
       <span class="hint">PWM output when joystick is fully deflected.</span>
     </div>
+    <div class="field">
+      <label for="snaptimeout-range">Inactivity snap-back (50 – 5000 ms)</label>
+      <input type="range" id="snaptimeout-range" min="50" max="5000" step="50" value="100"
+             oninput="document.getElementById('snaptimeout-num').value=this.value" />
+      <input type="number" id="snaptimeout-num" min="50" max="5000" step="50" value="100"
+             oninput="document.getElementById('snaptimeout-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">Joystick recenters if touch stops moving for this long.</span>
+    </div>
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
       <button class="btn btn-primary"   onclick="saveSettings()">Save</button>
@@ -267,11 +276,13 @@
     const statusText  = document.getElementById('status-text');
 
     // ── State ─────────────────────────────────────────────────────────────
-    let dragging       = false;
-    let currentSpeed   = 0;       // -1.0 … 1.0
-    let lastSendTime   = 0;
-    let ws             = null;
-    let reconnectTimer = null;
+    let dragging          = false;
+    let currentSpeed      = 0;       // -1.0 … 1.0
+    let lastSendTime      = 0;
+    let ws                = null;
+    let reconnectTimer    = null;
+    let inactivityTimer   = null;    // auto-recenter if touch stops moving
+    let snapTimeoutMs     = 100;     // loaded from /settings (default 100 ms)
 
     // ── Helpers ───────────────────────────────────────────────────────────
     function clampToPad(x, y) {
@@ -332,6 +343,24 @@
       refreshSpeedDisplay(0);
       sendSpeed(0);
       lastSendTime = Date.now();
+      clearInactivityTimer();
+    }
+
+    // ── Inactivity snap-back ───────────────────────────────────────────────
+    // If the touch/pointer stops moving while dragging, treat it as a release.
+    function resetInactivityTimer() {
+      clearInactivityTimer();
+      if (!dragging) return;
+      inactivityTimer = setTimeout(function () {
+        if (dragging) {
+          dragging = false;
+          snapBack();
+        }
+      }, snapTimeoutMs);
+    }
+
+    function clearInactivityTimer() {
+      if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
     }
 
     // ── Joystick: pointer events (mouse + touch + stylus unified) ─────────
@@ -346,6 +375,7 @@
       dragging = true;
       const { x, y } = relativePos(e);
       updatePuck(x, y);
+      resetInactivityTimer();
     });
 
     pad.addEventListener('pointermove', function (e) {
@@ -353,11 +383,13 @@
       e.preventDefault();
       const { x, y } = relativePos(e);
       updatePuck(x, y);
+      resetInactivityTimer();
     });
 
     function onPointerEnd() {
       if (!dragging) return;
       dragging = false;
+      clearInactivityTimer();
       snapBack();
     }
 
@@ -419,20 +451,26 @@
           const v = data.maxSpeed !== undefined ? data.maxSpeed : 512;
           document.getElementById('maxspeed-range').value = v;
           document.getElementById('maxspeed-num').value   = v;
+
+          const t = data.snapTimeout !== undefined ? data.snapTimeout : 100;
+          document.getElementById('snaptimeout-range').value = t;
+          document.getElementById('snaptimeout-num').value   = t;
         })
         .catch(function (e) { console.warn('Failed to load settings:', e); });
     }
 
     function saveSettings() {
-      const maxSpeed = parseInt(document.getElementById('maxspeed-num').value, 10);
+      const maxSpeed    = parseInt(document.getElementById('maxspeed-num').value, 10);
+      const snapTimeout = parseInt(document.getElementById('snaptimeout-num').value, 10);
       fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maxSpeed: maxSpeed })
+        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {
           if (data.ok) {
+            snapTimeoutMs = snapTimeout;  // apply immediately
             document.getElementById('settings-panel').style.display = 'none';
           }
         })
@@ -461,6 +499,15 @@
     })();
 
     // ── Init ──────────────────────────────────────────────────────────────
+    // Load snapTimeout from firmware before connecting so the inactivity timer
+    // uses the persisted value immediately.
+    fetch('/settings')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.snapTimeout !== undefined) snapTimeoutMs = data.snapTimeout;
+      })
+      .catch(function () {});  // non-fatal; default value is already set
+
     connect();
   </script>
 </body>
