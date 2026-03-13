@@ -286,8 +286,7 @@
       const rect = pad.getBoundingClientRect();
       const cx = rect.left + rect.width  / 2;
       const cy = rect.top  + rect.height / 2;
-      const src = e.touches ? e.touches[0] : e;
-      return { x: src.clientX - cx, y: src.clientY - cy };
+      return { x: e.clientX - cx, y: e.clientY - cy };
     }
 
     function updatePuck(rawX, rawY) {
@@ -335,46 +334,35 @@
       lastSendTime = Date.now();
     }
 
-    // ── Joystick: mouse ───────────────────────────────────────────────────
-    pad.addEventListener('mousedown', function (e) {
+    // ── Joystick: pointer events (mouse + touch + stylus unified) ─────────
+    // Using the Pointer Events API ensures pointercancel fires when an OS
+    // gesture, notification, or other interruption steals the touch — which
+    // would silently leave the joystick stuck under the old touch/mouse model.
+    // setPointerCapture guarantees pointerup/pointercancel are always delivered
+    // even when the finger moves outside the element.
+    pad.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      pad.setPointerCapture(e.pointerId);
       dragging = true;
+      const { x, y } = relativePos(e);
+      updatePuck(x, y);
+    });
+
+    pad.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
       e.preventDefault();
       const { x, y } = relativePos(e);
       updatePuck(x, y);
     });
 
-    document.addEventListener('mousemove', function (e) {
-      if (!dragging) return;
-      const { x, y } = relativePos(e);
-      updatePuck(x, y);
-    });
-
-    document.addEventListener('mouseup', function () {
+    function onPointerEnd() {
       if (!dragging) return;
       dragging = false;
       snapBack();
-    });
+    }
 
-    // ── Joystick: touch ───────────────────────────────────────────────────
-    pad.addEventListener('touchstart', function (e) {
-      dragging = true;
-      e.preventDefault();
-      const { x, y } = relativePos(e);
-      updatePuck(x, y);
-    }, { passive: false });
-
-    document.addEventListener('touchmove', function (e) {
-      if (!dragging) return;
-      e.preventDefault();
-      const { x, y } = relativePos(e);
-      updatePuck(x, y);
-    }, { passive: false });
-
-    document.addEventListener('touchend', function () {
-      if (!dragging) return;
-      dragging = false;
-      snapBack();
-    });
+    pad.addEventListener('pointerup',     onPointerEnd);
+    pad.addEventListener('pointercancel', onPointerEnd);  // OS/browser interruption
 
     // ── Heartbeat ─────────────────────────────────────────────────────────
     // Keep the firmware watchdog alive when joystick is held non-zero.
