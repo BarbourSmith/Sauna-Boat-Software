@@ -251,6 +251,15 @@
              style="margin-top:4px;" />
       <span class="hint">Joystick recenters if touch stops moving for this long.</span>
     </div>
+    <div class="field">
+      <label for="rampms-range">Speed ramp time (0 – 2000 ms)</label>
+      <input type="range" id="rampms-range" min="0" max="2000" step="50" value="500"
+             oninput="document.getElementById('rampms-num').value=this.value" />
+      <input type="number" id="rampms-num" min="0" max="2000" step="50" value="500"
+             oninput="document.getElementById('rampms-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">Time to ramp from stop to full speed. 0 = instant.</span>
+    </div>
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
       <button class="btn btn-primary"   onclick="saveSettings()">Save</button>
@@ -451,6 +460,10 @@
           const t = data.snapTimeout !== undefined ? data.snapTimeout : 100;
           document.getElementById('snaptimeout-range').value = t;
           document.getElementById('snaptimeout-num').value   = t;
+
+          const r = data.rampMs !== undefined ? data.rampMs : 500;
+          document.getElementById('rampms-range').value = r;
+          document.getElementById('rampms-num').value   = r;
         })
         .catch(function (e) { console.warn('Failed to load settings:', e); });
     }
@@ -458,10 +471,11 @@
     function saveSettings() {
       const maxSpeed    = parseInt(document.getElementById('maxspeed-num').value, 10);
       const snapTimeout = parseInt(document.getElementById('snaptimeout-num').value, 10);
+      const rampMs      = parseInt(document.getElementById('rampms-num').value, 10);
       fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout })
+        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {

@@ -45,8 +45,18 @@ public:
     void  stop();
 
     // Drive the motor at a normalized speed in the range [-1.0, 1.0].
-    // The magnitude is scaled by the configured maxSpeed (0–1023).
+    // The speed is stored as a target; call updateRamp() each loop to ramp
+    // the actual output toward it.
     void  setSpeed(float normalizedSpeed);
+
+    // Step the output speed toward the target at the configured ramp rate.
+    // Call this every loop iteration (~100 Hz).
+    void  updateRamp();
+
+    // Set the ramp rate in normalized-units per second.
+    // 0 = instant (no ramping).  Example: 2.0 = 0→100% in 500 ms.
+    void  setRampRate(float unitsPerSec);
+    float getRampRate() const;
 
     // Set/get the maximum PWM magnitude used by setSpeed() (0–1023).
     void  setMaxSpeed(int maxPWM);
@@ -98,4 +108,10 @@ private:
 
     // Maximum PWM magnitude used by setSpeed() (0–1023)
     int   _maxSpeed = 512;
+
+    // Ramp state
+    float         _targetSpeed  = 0.0f;   // normalized speed commanded by setSpeed()
+    float         _rampedSpeed  = 0.0f;   // normalized speed currently applied to motor
+    float         _rampRate     = 2.0f;   // units/s; 0 = instant
+    unsigned long _lastRampTime = 0;
 };

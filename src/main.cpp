@@ -153,8 +153,11 @@ void setup() {
     steeringMotor.setMaxSpeed(prefs.getInt("maxSpeed", 512));
     // snapTimeout is a UI-only value; the firmware just stores and serves it.
     int snapTimeout = prefs.getInt("snapTimeout", 100);
-    Serial.printf("[Setup] Settings loaded – maxSpeed=%d snapTimeout=%d\n",
-                  steeringMotor.getMaxSpeed(), snapTimeout);
+    // rampMs: time in ms to ramp from 0 to full speed (0 = instant).
+    int rampMs = prefs.getInt("rampMs", 500);
+    steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
+    Serial.printf("[Setup] Settings loaded – maxSpeed=%d snapTimeout=%d rampMs=%d\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
 
     // --- WiFi Access Point ---
     WiFi.softAP(AP_SSID, AP_PASS);
@@ -176,6 +179,7 @@ void setup() {
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
         String json = "{\"maxSpeed\":" + String(steeringMotor.getMaxSpeed())
                     + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
+                    + ",\"rampMs\":" + String(prefs.getInt("rampMs", 500))
                     + "}";
         request->send(200, "application/json", json);
     });
@@ -200,12 +204,19 @@ void setup() {
                            static_cast<float>(prefs.getInt("snapTimeout", 100))));
             snapTimeout = constrain(snapTimeout, 50, 5000);
 
+            int rampMs = static_cast<int>(
+                parseField(g_settingsBody, "rampMs",
+                           static_cast<float>(prefs.getInt("rampMs", 500))));
+            rampMs = constrain(rampMs, 0, 2000);
+
             steeringMotor.setMaxSpeed(maxSpeed);
+            steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
             prefs.putInt("maxSpeed", maxSpeed);
             prefs.putInt("snapTimeout", snapTimeout);
+            prefs.putInt("rampMs", rampMs);
 
-            Serial.printf("[Settings] Saved – maxSpeed=%d snapTimeout=%d\n",
-                          maxSpeed, snapTimeout);
+            Serial.printf("[Settings] Saved – maxSpeed=%d snapTimeout=%d rampMs=%d\n",
+                          maxSpeed, snapTimeout, rampMs);
             request->send(200, "application/json", "{\"ok\":true}");
         },
         nullptr,  // upload handler (not needed)
@@ -254,6 +265,9 @@ void loop() {
         lastCleanup = millis();
         ws.cleanupClients();
     }
+
+    // Step the motor output toward the commanded speed at the configured ramp rate
+    steeringMotor.updateRamp();
 
     delay(10);  // ~100 Hz loop
 }

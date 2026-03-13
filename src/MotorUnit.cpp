@@ -30,6 +30,7 @@ void MotorUnit::begin(int forwardPin, int backwardPin, int adcPin,
     _motor.stop();
 
     _lastPIDTime = millis();
+    _lastRampTime = millis();
     Serial.println("[MotorUnit] Initialised.");
 }
 
@@ -92,15 +93,43 @@ float MotorUnit::getDeadband() const { return _deadband; }
 
 void MotorUnit::stop() {
     _motor.stop();
-    _integral  = 0.0f;
-    _lastError = 0.0f;
+    _integral    = 0.0f;
+    _lastError   = 0.0f;
+    _targetSpeed = 0.0f;
+    _rampedSpeed = 0.0f;
 }
 
 void MotorUnit::setSpeed(float normalizedSpeed) {
-    normalizedSpeed = constrain(normalizedSpeed, -1.0f, 1.0f);
-    long pwm = static_cast<long>(normalizedSpeed * _maxSpeed);
-    _motor.runAtPWM(pwm);
+    _targetSpeed = constrain(normalizedSpeed, -1.0f, 1.0f);
 }
+
+void MotorUnit::updateRamp() {
+    unsigned long now = millis();
+    float dt = (now - _lastRampTime) / 1000.0f;
+    _lastRampTime = now;
+    if (dt <= 0.0f || dt > 0.5f) dt = 0.01f;
+
+    if (_rampRate <= 0.0f) {
+        _rampedSpeed = _targetSpeed;
+    } else {
+        float diff     = _targetSpeed - _rampedSpeed;
+        float maxDelta = _rampRate * dt;
+        if (fabsf(diff) <= maxDelta) {
+            _rampedSpeed = _targetSpeed;
+        } else {
+            _rampedSpeed += copysignf(maxDelta, diff);
+        }
+    }
+
+    if (_rampedSpeed == 0.0f) {
+        _motor.stop();
+    } else {
+        _motor.runAtPWM(static_cast<long>(_rampedSpeed * _maxSpeed));
+    }
+}
+
+void  MotorUnit::setRampRate(float unitsPerSec) { _rampRate = (unitsPerSec >= 0.0f) ? unitsPerSec : 0.0f; }
+float MotorUnit::getRampRate() const             { return _rampRate; }
 
 void MotorUnit::setMaxSpeed(int maxPWM) {
     _maxSpeed = constrain(maxPWM, 0, 1023);
