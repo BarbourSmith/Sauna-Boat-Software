@@ -96,6 +96,20 @@ void MotorUnit::stop() {
     _lastError = 0.0f;
 }
 
+void MotorUnit::setSpeed(float normalizedSpeed) {
+    normalizedSpeed = constrain(normalizedSpeed, -1.0f, 1.0f);
+    long pwm = static_cast<long>(normalizedSpeed * _maxSpeed);
+    _motor.runAtPWM(pwm);
+}
+
+void MotorUnit::setMaxSpeed(int maxPWM) {
+    _maxSpeed = constrain(maxPWM, 0, 1023);
+}
+
+int MotorUnit::getMaxSpeed() const {
+    return _maxSpeed;
+}
+
 float MotorUnit::_computeWrappedError() const {
     float error = _targetAngle - _currentAngle;
     // Normalise to [-180, 180] for shortest-path steering

@@ -44,6 +44,14 @@ public:
     // Stop the motor and reset the PID integrator.
     void  stop();
 
+    // Drive the motor at a normalized speed in the range [-1.0, 1.0].
+    // The magnitude is scaled by the configured maxSpeed (0–1023).
+    void  setSpeed(float normalizedSpeed);
+
+    // Set/get the maximum PWM magnitude used by setSpeed() (0–1023).
+    void  setMaxSpeed(int maxPWM);
+    int   getMaxSpeed() const;
+
     // Returns true if the AS5600 magnet is detected.
     bool  hasMagnet();
 
@@ -87,4 +95,7 @@ private:
     float _ki       = 0.005f;
     float _kd       = 0.3f;
     float _deadband = 3.0f;
+
+    // Maximum PWM magnitude used by setSpeed() (0–1023)
+    int   _maxSpeed = 512;
 };
