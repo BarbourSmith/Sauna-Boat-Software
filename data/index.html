@@ -422,18 +422,14 @@
 
       ws.onerror = function () { ws.close(); };
 
-      ws.onmessage = function (evt) {
-        try {
-          const data = JSON.parse(evt.data);
-          if (data.speed !== undefined && !dragging) {
-            // Reflect server-side speed only when not actively dragging
-            currentSpeed = data.speed;
-            refreshSpeedDisplay(data.speed);
-          }
-        } catch (e) {
-          console.warn('Failed to parse WS message:', evt.data);
-        }
-      };
+      // Server broadcasts are intentionally ignored for speed state.
+      // The client is the sole authority on what speed it is commanding.
+      // Echoing server speed back into currentSpeed caused a race condition:
+      // after snapBack() the firmware could broadcast the stale non-zero speed
+      // just before it processed the speed=0 message, resetting currentSpeed to
+      // non-zero while the puck was already visually centred — and then the
+      // heartbeat would re-send that stale speed to the motor.
+      ws.onmessage = function () {};
     }
 
     // ── Settings ──────────────────────────────────────────────────────────
