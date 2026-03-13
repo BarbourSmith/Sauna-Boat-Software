@@ -413,13 +413,24 @@
 
     // ── WebSocket ─────────────────────────────────────────────────────────
     function connect() {
+      // Cancel any pending retry timer.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
+      // Detach handlers from the old socket so stale close/error events
+      // can't race with the new connection and spawn extra retry timers.
+      if (ws) {
+        ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      }
+
       const host = window.location.hostname;
       ws = new WebSocket('ws://' + host + '/ws');
 
       ws.onopen = function () {
         statusDot.classList.add('connected');
         statusText.textContent = 'Connected';
-        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       };
 
       ws.onclose = function () {
@@ -507,6 +518,19 @@
         if (document.visibilityState === 'visible') tryPlay();
       });
     })();
+
+    // ── Reconnect on screen wake / network restore ─────────────────────────
+    // Mobile browsers freeze JS when the screen locks. On wake, attempt an
+    // immediate reconnect rather than waiting for the 3-second retry timer.
+    function reconnectIfNeeded() {
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connect();
+      }
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') reconnectIfNeeded();
+    });
+    window.addEventListener('online', reconnectIfNeeded);
 
     // ── Init ──────────────────────────────────────────────────────────────
     // Load snapTimeout from firmware before connecting so the inactivity timer
