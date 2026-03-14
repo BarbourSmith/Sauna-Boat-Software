@@ -1,23 +1,23 @@
-// main.cpp – Sauna Boat Auto Steering System
+// main.cpp – Sauna Boat Steering Module
 // ESP32-S3 firmware for the Maslow 4 control board
 //
 // Hardware: Bottom-Right motor port on Maslow 4 board
-//   Motor forward pin : GPIO 9  (brIn1Pin)
-//   Motor backward pin: GPIO 3  (brIn2Pin)
+//   Motor forward pin : GPIO 9  (brIn2Pin – wires swapped vs encoder direction)
+//   Motor backward pin: GPIO 3  (brIn1Pin – wires swapped vs encoder direction)
 //   Current sense pin : GPIO 7  (brADCPin)
-//   Encoder I2C mux ch: 0       (BREncoderLine)
-//   LEDC PWM channel 1: 6       (brIn1Channel)
-//   LEDC PWM channel 2: 7       (brIn2Channel)
 //   I2C SDA           : GPIO 5
 //   I2C SCL           : GPIO 4
 //   I2C speed         : 200 kHz
 //   I2C Mux address   : 0x70
+//   LEDC PWM channel 1: 6
+//   LEDC PWM channel 2: 7
+//
+// Speed commands are accepted from two sources (last write wins):
+//   1. Phone web UI  →  WebSocket JSON   {"speed": 0.5}
+//   2. Controller    →  ESP-NOW mesh     MSG_SET_SPEED
 //
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
-//
-// Mesh: receives MSG_SET_ANGLE messages from other modules via ESP-NOW.
-// The soft-AP is fixed to MESH_WIFI_CHANNEL so ESP-NOW and WiFi share one channel.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -39,52 +39,87 @@ static const char* AP_PASS = "12345678";
 // ---------------------------------------------------------------------------
 // Maslow 4 board pin definitions – Bottom-Right motor port
 // ---------------------------------------------------------------------------
-#define I2C_SDA_PIN       5
-#define I2C_SCL_PIN       4
-#define I2C_FREQ_HZ       200000
-#define I2C_MUX_ADDR      0x70
+#define I2C_SDA_PIN      5
+#define I2C_SCL_PIN      4
+#define I2C_FREQ_HZ      200000
+#define I2C_MUX_ADDR     0x70
 
-#define BR_FORWARD_PIN    3    // brIn2Pin (swapped: motor wires are inverse to encoder direction)
-#define BR_BACKWARD_PIN   9    // brIn1Pin (swapped: motor wires are inverse to encoder direction)
-#define BR_ADC_PIN        7    // brADCPin
-#define BR_ENCODER_CH     0    // BREncoderLine
-#define BR_PWM_CHANNEL1   6    // brIn1Channel
-#define BR_PWM_CHANNEL2   7    // brIn2Channel
+#define BR_FORWARD_PIN   3   // brIn2Pin (swapped)
+#define BR_BACKWARD_PIN  9   // brIn1Pin (swapped)
+#define BR_ADC_PIN       7
+#define BR_ENCODER_CH    0
+#define BR_PWM_CHANNEL1  6
+#define BR_PWM_CHANNEL2  7
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
-static QWIICMUX    i2cMux;
-static MotorUnit   steeringMotor;
+static QWIICMUX       i2cMux;
+static MotorUnit      steeringMotor;
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
-static Preferences prefs;
+static Preferences    prefs;
 
-// North-trim offset (degrees): the raw encoder angle that maps to heading 0°.
-// Applied client-side for display; persisted here so the browser can reload it.
-static float g_northTrim = 0.0f;
+// Most recent normalized speed command (-1.0 to 1.0).
+static float         g_currentSpeed = 0.0f;
 
-// Accumulation buffer for POST /settings request body
+// Timestamp of the last speed command from any source (ms).
+// Watchdog stops the motor if this goes stale.
+static unsigned long g_lastCmdTime  = 0;
+
+// Motor stops if no command is received within this window.
+// 200 ms means even one missed 100 ms heartbeat triggers a stop.
+static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
+
+// Accumulation buffer for POST /settings body
 static String g_settingsBody;
 
 // ---------------------------------------------------------------------------
-// ESP-NOW receive callback
-// Called from the WiFi driver task; keep it short and ISR-safe.
+// Mesh diagnostics
 // ---------------------------------------------------------------------------
-static void onMeshReceive(const uint8_t* mac, const uint8_t* incomingData, int len) {
-    if (len < static_cast<int>(sizeof(MeshMessage))) return;
-    MeshMessage msg;
-    memcpy(&msg, incomingData, sizeof(msg));
+// Tracks the ESP-NOW link to the controller module so we can print its health.
+static unsigned long g_lastMeshRxTime  = 0;    // millis() of last received ESP-NOW packet
+static float         g_lastMeshSpeed   = 0.0f; // last speed value received over mesh
+static uint8_t       g_lastMeshSrc     = 0x00; // MODULE_* id of last sender
 
-    switch (msg.type) {
-        case MSG_SET_ANGLE: {
-            float angle = constrain(msg.value1, 0.0f, 360.0f);
-            steeringMotor.setTargetAngle(angle);
-            Serial.printf("[Mesh] MSG_SET_ANGLE from 0x%02X → %.1f°\n", msg.src, angle);
-            break;
-        }
-        default:
-            break;
+// How long without a mesh packet before we consider the link "lost" (ms).
+static constexpr unsigned long MESH_TIMEOUT_MS = 500;
+
+// Which source set the current speed ("WS"=phone, "Mesh"=controller, "---"=none yet)
+static const char* g_cmdSource = "---";
+
+// ---------------------------------------------------------------------------
+// ESP-NOW receive callback
+// Runs in the WiFi driver task. Keep it short.
+// g_currentSpeed and g_lastCmdTime are 32-bit aligned — assignments are atomic
+// on Xtensa, so no mutex is needed for these simple status variables.
+// ---------------------------------------------------------------------------
+static void onMeshReceive(const uint8_t* mac, const uint8_t* data, int len) {
+    if (len < static_cast<int>(sizeof(MeshMessage))) {
+        Serial.printf("[Mesh] RX: packet too short (%d bytes), ignoring\n", len);
+        return;
+    }
+
+    MeshMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+
+    // Record that the link is alive regardless of message type.
+    g_lastMeshRxTime = millis();
+    g_lastMeshSrc    = msg.src;
+
+    if (msg.type == MSG_SET_SPEED) {
+        float speed = constrain(msg.value1, -1.0f, 1.0f);
+        steeringMotor.setSpeed(speed);
+        g_currentSpeed  = speed;
+        g_lastCmdTime   = millis();
+        g_lastMeshSpeed = speed;
+        g_cmdSource     = "Mesh";
+
+        Serial.printf("[Mesh] MSG_SET_SPEED from module 0x%02X → %.2f\n",
+                      msg.src, speed);
+    } else {
+        Serial.printf("[Mesh] RX: unknown type 0x%02X from module 0x%02X, ignoring\n",
+                      msg.type, msg.src);
     }
 }
 
@@ -96,48 +131,47 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
     if (type == WS_EVT_CONNECT) {
         Serial.printf("[WS] Client #%u connected from %s\n",
                       client->id(), client->remoteIP().toString().c_str());
-        // Send current state immediately on connect
-        float current = steeringMotor.getCurrentAngle();
-        float target  = steeringMotor.getTargetAngle();
-        String msg = "{\"current\":" + String(current, 1)
-                   + ",\"target\":"  + String(target, 1) + "}";
+        // Echo current speed so the UI is in sync immediately.
+        String msg = "{\"speed\":" + String(g_currentSpeed, 2) + "}";
         client->text(msg);
 
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
-        // Release the slot immediately so a rapid page-refresh can reconnect
-        // without waiting for the periodic 1-second cleanup task.
+        // Stop the motor and reset speed when the phone disconnects so the
+        // watchdog doesn't race to do it first with a stale non-zero speed.
+        steeringMotor.stop();
+        g_currentSpeed = 0.0f;
+        g_cmdSource    = "---";
+        // Release the WS slot immediately so a rapid page-refresh reconnects
+        // without waiting for the 1-second periodic cleanup.
         srv->cleanupClients();
 
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo* info = reinterpret_cast<AwsFrameInfo*>(arg);
-        // Only handle complete, single-frame text messages
         if (info->final && info->index == 0 && info->len == len
                 && info->opcode == WS_TEXT) {
-            // Copy to a null-terminated String to avoid out-of-bounds write on data[]
             String msg(reinterpret_cast<const char*>(data), len);
 
-            // Parse simple JSON: {"angle":180.0}
-            int idx = msg.indexOf("\"angle\":");
+            // Parse {"speed":0.5}
+            int idx = msg.indexOf("\"speed\":");
             if (idx >= 0) {
-                float angle = msg.substring(idx + 8).toFloat();
-                angle = constrain(angle, 0.0f, 360.0f);
-                steeringMotor.setTargetAngle(angle);
-                Serial.printf("[WS] New target angle: %.1f\xC2\xB0\n", angle);
+                float speed = msg.substring(idx + 8).toFloat();
+                speed = constrain(speed, -1.0f, 1.0f);
+                steeringMotor.setSpeed(speed);
+                g_currentSpeed = speed;
+                g_lastCmdTime  = millis();
+                g_cmdSource    = "WS";
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast current and target angles to all connected WebSocket clients
+// Broadcast current speed to all WebSocket clients
 // ---------------------------------------------------------------------------
 static void broadcastStatus() {
     if (ws.count() == 0) return;
-    float current = steeringMotor.getCurrentAngle();
-    float target  = steeringMotor.getTargetAngle();
-    String msg = "{\"current\":" + String(current, 1)
-               + ",\"target\":"  + String(target, 1) + "}";
+    String msg = "{\"speed\":" + String(g_currentSpeed, 2) + "}";
     ws.textAll(msg);
 }
 
@@ -147,34 +181,25 @@ static void broadcastStatus() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== Sauna Boat Auto Steering System ===");
+    Serial.println("\n=== Sauna Boat Steering Module ===");
 
-    // --- I2C bus ---
+    // --- I2C bus (needed by MotorUnit even in speed-only mode) ---
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
     Wire.setTimeOut(10);
 
-    // --- I2C Multiplexer (TCA9548A on Maslow 4 board) ---
+    // --- I2C Multiplexer ---
     if (!i2cMux.begin(I2C_MUX_ADDR, Wire)) {
-        Serial.println("[Setup] WARNING: I2C Mux not found – check wiring.");
+        Serial.println("[Setup] WARNING: I2C Mux not found – encoder unavailable.");
     } else {
         Serial.println("[Setup] I2C Mux connected.");
     }
 
-    // --- Steering motor (Bottom-Right port) ---
+    // --- Motor (speed-based; encoder init may fail but motor still works) ---
     steeringMotor.begin(BR_FORWARD_PIN, BR_BACKWARD_PIN, BR_ADC_PIN,
                         BR_ENCODER_CH, BR_PWM_CHANNEL1, BR_PWM_CHANNEL2,
                         i2cMux);
-    Serial.printf("[Setup] Encoder connected: %s\n",
-                  steeringMotor.isEncoderConnected() ? "YES" : "NO");
-    Serial.printf("[Setup] Magnet detected:   %s\n",
-                  steeringMotor.hasMagnet() ? "YES" : "NO");
-    if (steeringMotor.updateEncoderPosition()) {
-        Serial.printf("[Setup] Initial angle: %.1f deg\n", steeringMotor.getCurrentAngle());
-    } else {
-        Serial.println("[Setup] WARNING: Could not read encoder angle on startup!");
-    }
 
-    // --- LittleFS (stores index.html) ---
+    // --- LittleFS (serves index.html) ---
     if (!LittleFS.begin(true)) {
         Serial.println("[Setup] ERROR: LittleFS mount failed!");
     } else {
@@ -183,28 +208,27 @@ void setup() {
 
     // --- NVS: load persisted settings ---
     prefs.begin("steering", false);
-    steeringMotor.setKp(      prefs.getFloat("kp",       3.5f));
-    steeringMotor.setKi(      prefs.getFloat("ki",       0.005f));
-    steeringMotor.setKd(      prefs.getFloat("kd",       0.3f));
-    steeringMotor.setDeadband(prefs.getFloat("deadband", 3.0f));
-    g_northTrim = prefs.getFloat("northTrim", 0.0f);
-    Serial.printf("[Setup] Settings loaded – Kp=%.3f Ki=%.4f Kd=%.3f deadband=%.1f northTrim=%.1f\n",
-                  steeringMotor.getKp(), steeringMotor.getKi(),
-                  steeringMotor.getKd(), steeringMotor.getDeadband(), g_northTrim);
+    steeringMotor.setMaxSpeed(prefs.getInt("maxSpeed", 512));
+    int snapTimeout = prefs.getInt("snapTimeout", 100);
+    int rampMs      = prefs.getInt("rampMs", 500);
+    steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
+    Serial.printf("[Setup] Settings – maxSpeed=%d  snapTimeout=%d  rampMs=%d\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
 
-    // --- WiFi Access Point ---
-    // Pin the AP to MESH_WIFI_CHANNEL so ESP-NOW and the phone AP share the
-    // same channel — the ESP32 radio can only operate on one channel at a time.
+    // --- WiFi AP pinned to MESH_WIFI_CHANNEL ---
+    // ESP-NOW and the soft-AP must share a channel; we fix both to channel 1.
     WiFi.softAP(AP_SSID, AP_PASS, MESH_WIFI_CHANNEL);
     IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[Setup] WiFi AP \"%s\" on channel %d started.\n", AP_SSID, MESH_WIFI_CHANNEL);
-    Serial.printf("[Setup] Open http://%s in your browser.\n", ip.toString().c_str());
+    Serial.printf("[Setup] WiFi AP \"%s\" started (channel %d)\n",
+                  AP_SSID, MESH_WIFI_CHANNEL);
+    Serial.printf("[Setup] Open http://%s in a browser\n", ip.toString().c_str());
+    Serial.printf("[Setup] Steering MAC: %s\n", WiFi.softAPmacAddress().c_str());
 
-    // --- ESP-NOW (mesh receive) ---
+    // --- ESP-NOW ---
     if (esp_now_init() != ESP_OK) {
         Serial.println("[Setup] ERROR: ESP-NOW init failed!");
     } else {
-        Serial.println("[Setup] ESP-NOW initialised.");
+        Serial.println("[Setup] ESP-NOW initialised – listening for mesh packets");
         esp_now_register_recv_cb(onMeshReceive);
     }
 
@@ -213,35 +237,20 @@ void setup() {
     server.addHandler(&ws);
 
     // --- HTTP routes ---
-    // Serve the web UI
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
         request->send(LittleFS, "/index.html", "text/html");
     });
 
-    // JSON status endpoint for polling clients
-    server.on("/status", HTTP_GET, [](AsyncWebServerRequest* request) {
-        float current = steeringMotor.getCurrentAngle();
-        float target  = steeringMotor.getTargetAngle();
-        String json = "{\"current\":" + String(current, 1)
-                    + ",\"target\":"  + String(target, 1) + "}";
-        request->send(200, "application/json", json);
-    });
-
-    // GET /settings – returns all tunable parameters as JSON
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"kp\":"        + String(steeringMotor.getKp(),       3)
-                    + ",\"ki\":"        + String(steeringMotor.getKi(),       4)
-                    + ",\"kd\":"        + String(steeringMotor.getKd(),       3)
-                    + ",\"deadband\":"+  String(steeringMotor.getDeadband(),  1)
-                    + ",\"northTrim\":" + String(g_northTrim,                 1)
+        String json = "{\"maxSpeed\":"   + String(steeringMotor.getMaxSpeed())
+                    + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
+                    + ",\"rampMs\":"      + String(prefs.getInt("rampMs", 500))
                     + "}";
         request->send(200, "application/json", json);
     });
 
-    // POST /settings – accepts JSON body with any subset of the above fields
     server.on("/settings", HTTP_POST,
         [](AsyncWebServerRequest* request) {
-            // Parse fields from the accumulated body
             auto parseField = [](const String& json, const char* key, float fallback) -> float {
                 String search = "\""; search += key; search += "\":";
                 int idx = json.indexOf(search);
@@ -249,31 +258,30 @@ void setup() {
                 return json.substring(idx + search.length()).toFloat();
             };
 
-            float kp       = parseField(g_settingsBody, "kp",        steeringMotor.getKp());
-            float ki       = parseField(g_settingsBody, "ki",        steeringMotor.getKi());
-            float kd       = parseField(g_settingsBody, "kd",        steeringMotor.getKd());
-            float deadband = parseField(g_settingsBody, "deadband",  steeringMotor.getDeadband());
-            float northTrim= parseField(g_settingsBody, "northTrim", g_northTrim);
+            int maxSpeed = constrain(static_cast<int>(
+                parseField(g_settingsBody, "maxSpeed",
+                           static_cast<float>(steeringMotor.getMaxSpeed()))), 0, 1023);
 
-            steeringMotor.setKp(kp);
-            steeringMotor.setKi(ki);
-            steeringMotor.setKd(kd);
-            steeringMotor.setDeadband(deadband);
-            g_northTrim = northTrim;
+            int snapTimeout = constrain(static_cast<int>(
+                parseField(g_settingsBody, "snapTimeout",
+                           static_cast<float>(prefs.getInt("snapTimeout", 100)))), 50, 5000);
 
-            prefs.putFloat("kp",        kp);
-            prefs.putFloat("ki",        ki);
-            prefs.putFloat("kd",        kd);
-            prefs.putFloat("deadband",  deadband);
-            prefs.putFloat("northTrim", northTrim);
+            int rampMs = constrain(static_cast<int>(
+                parseField(g_settingsBody, "rampMs",
+                           static_cast<float>(prefs.getInt("rampMs", 500)))), 0, 2000);
 
-            Serial.printf("[Settings] Saved – Kp=%.3f Ki=%.4f Kd=%.3f deadband=%.1f northTrim=%.1f\n",
-                          kp, ki, kd, deadband, northTrim);
+            steeringMotor.setMaxSpeed(maxSpeed);
+            steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
+            prefs.putInt("maxSpeed",    maxSpeed);
+            prefs.putInt("snapTimeout", snapTimeout);
+            prefs.putInt("rampMs",      rampMs);
+
+            Serial.printf("[Settings] Saved – maxSpeed=%d  snapTimeout=%d  rampMs=%d\n",
+                          maxSpeed, snapTimeout, rampMs);
             request->send(200, "application/json", "{\"ok\":true}");
         },
-        nullptr,  // upload handler (not needed)
-        [](AsyncWebServerRequest* /*request*/, uint8_t* data, size_t len,
-           size_t index, size_t /*total*/) {
+        nullptr,
+        [](AsyncWebServerRequest*, uint8_t* data, size_t len, size_t index, size_t) {
             if (index == 0) g_settingsBody = "";
             g_settingsBody += String(reinterpret_cast<const char*>(data), len);
         }
@@ -281,46 +289,63 @@ void setup() {
 
     server.begin();
     Serial.println("[Setup] HTTP server started.");
+    Serial.println("[Setup] Ready – waiting for commands from phone (WS) or controller (Mesh)");
 }
 
 // ---------------------------------------------------------------------------
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
-    // Update encoder reading (~100 Hz is sufficient for steering)
-    bool encoderOk = steeringMotor.updateEncoderPosition();
+    unsigned long now = millis();
 
-    // Periodically log diagnostics to serial for debugging
-    static unsigned long lastDiag = 0;
-    if (millis() - lastDiag >= 500) {
-        lastDiag = millis();
-        Serial.printf("[Loop] encoder=%s current=%.1f target=%.1f motorCurrent=%.0f\n",
-                      encoderOk ? "OK" : "FAIL",
-                      steeringMotor.getCurrentAngle(),
-                      steeringMotor.getTargetAngle(),
-                      steeringMotor.getMotorCurrent());
-    }
-
-    // Only run PID if the encoder is responding; otherwise stop the motor
-    if (encoderOk) {
-        steeringMotor.recomputePID();
-    } else {
+    // --- Safety watchdog ---
+    // Stop the motor if no command (from any source) arrives in time.
+    if (g_currentSpeed != 0.0f && (now - g_lastCmdTime) > WATCHDOG_TIMEOUT_MS) {
+        Serial.printf("[Loop] Watchdog triggered (%.0f ms since last cmd) – stopping\n",
+                      static_cast<float>(now - g_lastCmdTime));
         steeringMotor.stop();
+        g_currentSpeed = 0.0f;
+        g_cmdSource    = "---";
     }
 
-    // Broadcast angle data to WebSocket clients every 100 ms
+    // --- Diagnostics (every 500 ms) ---
+    static unsigned long lastDiag = 0;
+    if (now - lastDiag >= 500) {
+        lastDiag = now;
+
+        // Mesh link health
+        bool meshLive = (g_lastMeshRxTime > 0) &&
+                        (now - g_lastMeshRxTime < MESH_TIMEOUT_MS);
+        const char* meshStatus = (g_lastMeshRxTime == 0) ? "NONE"
+                               : (meshLive            ? "LIVE" : "LOST");
+        unsigned long meshAge  = (g_lastMeshRxTime > 0) ? (now - g_lastMeshRxTime) : 0;
+
+        Serial.printf("[Loop] speed=%.2f  src=%s | mesh=%s  lastRx=%lums ago  lastSpeed=%.2f  src=0x%02X | WS clients=%u\n",
+                      g_currentSpeed,
+                      g_cmdSource,
+                      meshStatus,
+                      meshAge,
+                      g_lastMeshSpeed,
+                      g_lastMeshSrc,
+                      ws.count());
+    }
+
+    // --- Ramp motor toward commanded speed ---
+    steeringMotor.updateRamp();
+
+    // --- Broadcast speed to WebSocket clients (100 ms) ---
     static unsigned long lastBroadcast = 0;
-    if (millis() - lastBroadcast >= 100) {
-        lastBroadcast = millis();
+    if (now - lastBroadcast >= 100) {
+        lastBroadcast = now;
         broadcastStatus();
     }
 
-    // Periodically clean up disconnected WebSocket clients
+    // --- WebSocket cleanup (1 s) ---
     static unsigned long lastCleanup = 0;
-    if (millis() - lastCleanup >= 1000) {
-        lastCleanup = millis();
+    if (now - lastCleanup >= 1000) {
+        lastCleanup = now;
         ws.cleanupClients();
     }
 
-    delay(10);  // ~100 Hz control loop
+    delay(10); // ~100 Hz loop
 }

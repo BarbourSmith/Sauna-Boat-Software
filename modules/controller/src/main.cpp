@@ -36,7 +36,13 @@ static constexpr unsigned long SEND_INTERVAL_MS = 50;
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-static bool g_ps3Connected = false;
+static bool          g_ps3Connected  = false;
+
+// ESP-NOW send diagnostics
+static uint32_t      g_sendCount     = 0;   // total packets sent
+static uint32_t      g_sendOkCount   = 0;   // successful sends
+static uint32_t      g_sendFailCount = 0;   // failed sends
+static float         g_lastSentSpeed = 0.0f;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW helpers
@@ -48,11 +54,17 @@ static void sendSpeed(float speed) {
     msg.value1 = speed;
     msg.value2 = 0.0f;
     esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    ++g_sendCount;
+    g_lastSentSpeed = speed;
 }
 
-static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t /*status*/) {
-    // Uncomment to debug send failures:
-    // Serial.printf("[Mesh] %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t status) {
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        ++g_sendOkCount;
+    } else {
+        ++g_sendFailCount;
+        Serial.println("[Mesh] WARNING: Send FAILED!");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,11 +164,21 @@ void loop() {
     if (now - lastLog >= 500) {
         lastLog = now;
         if (g_ps3Connected) {
-            Serial.printf("[Loop] stickX=%d  speed=%.2f\n",
+            Serial.printf("[Loop] PS3=OK  stickX=%d  speed=%.2f | "
+                          "mesh: sent=%lu ok=%lu fail=%lu  lastSpeed=%.2f\n",
                           static_cast<int>(Ps3.data.analog.stick.lx),
-                          Ps3.data.analog.stick.lx / 127.0f);
+                          Ps3.data.analog.stick.lx / 127.0f,
+                          (unsigned long)g_sendCount,
+                          (unsigned long)g_sendOkCount,
+                          (unsigned long)g_sendFailCount,
+                          g_lastSentSpeed);
         } else {
-            Serial.println("[Loop] Waiting for PS3 controller…");
+            Serial.printf("[Loop] PS3=WAITING | "
+                          "mesh: sent=%lu ok=%lu fail=%lu  lastSpeed=%.2f\n",
+                          (unsigned long)g_sendCount,
+                          (unsigned long)g_sendOkCount,
+                          (unsigned long)g_sendFailCount,
+                          g_lastSentSpeed);
         }
     }
 
