@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sauna Boat – Auto Steering</title>
+  <style>
+    :root {
+      --bg:        #0d1b2a;
+      --panel:     #1b2d42;
+      --accent:    #00b4d8;
+      --accent2:   #f77f00;
+      --text:      #e0e0e0;
+      --subtext:   #8fa8c0;
+      --green:     #4ade80;
+      --red:       #f87171;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* Prevent accidental text selection during swipe gestures */
+    body, .card, .readouts, .readout, .legend, .presets, header, #status-bar {
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    /* Keep text selectable only on elements that need it */
+    input[type="range"] { -webkit-user-select: auto; user-select: auto; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+      gap: 24px;
+    }
+
+    /* ── Status pill ── */
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border-radius: 999px;
+      padding: 6px 16px;
+      font-size: 0.82rem;
+    }
+    #status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+    #status-dot.connected { background: var(--green); }
+    #status-text { color: var(--subtext); }
+
+    /* ── Compass card ── */
+    .card {
+      background: var(--panel);
+      border-radius: 16px;
+      padding: 24px;
+      width: 100%;
+      max-width: 420px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+
+    /* ── SVG compass ── */
+    #compass-wrap {
+      position: relative;
+      width: 240px;
+      height: 240px;
+    }
+    #compass-svg {
+      width: 100%; height: 100%;
+    }
+    /* target needle (accent blue) */
+    #needle-target {
+      transform-origin: 120px 120px;
+      transition: transform 0.3s ease;
+    }
+    /* current needle (orange) */
+    #needle-current {
+      transform-origin: 120px 120px;
+      transition: transform 0.15s linear;
+    }
+
+    /* ── Angle readouts ── */
+    .readouts {
+      display: flex;
+      gap: 24px;
+      justify-content: center;
+      width: 100%;
+    }
+    .readout {
+      text-align: center;
+      flex: 1;
+    }
+    .readout-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--subtext);
+      margin-bottom: 4px;
+    }
+    .readout-value {
+      font-size: 2rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .readout-value.target  { color: var(--accent); }
+    .readout-value.current { color: var(--accent2); }
+    .readout-unit {
+      font-size: 0.85rem;
+      color: var(--subtext);
+      margin-left: 2px;
+    }
+
+    /* ── Slider section ── */
+    .slider-section {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .slider-label {
+      font-size: 0.8rem;
+      color: var(--subtext);
+      min-width: 28px;
+      text-align: right;
+    }
+    input[type="range"] {
+      flex: 1;
+      -webkit-appearance: none;
+      height: 6px;
+      border-radius: 3px;
+      background: #2a3f57;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 3px solid var(--bg);
+      box-shadow: 0 0 6px rgba(0,180,216,0.6);
+      cursor: pointer;
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 22px; height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 3px solid var(--bg);
+      cursor: pointer;
+    }
+
+    /* ── Settings button ── */
+    #settings-toggle {
+      background: var(--panel);
+      border: 1px solid #2a3f57;
+      border-radius: 999px;
+      color: var(--subtext);
+      cursor: pointer;
+      font-size: 0.82rem;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    #settings-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+    /* ── Settings panel ── */
+    #settings-panel {
+      width: 100%;
+      max-width: 420px;
+      display: none;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .settings-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .settings-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .settings-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .settings-label {
+      font-size: 0.82rem;
+      color: var(--subtext);
+      flex: 1;
+    }
+    .settings-input {
+      width: 90px;
+      background: #0d1b2a;
+      border: 1px solid #2a3f57;
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+      padding: 6px 8px;
+      text-align: right;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .settings-input:focus { outline: none; border-color: var(--accent); }
+    .settings-divider {
+      height: 1px;
+      background: #2a3f57;
+    }
+    .btn-primary, .btn-secondary {
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      padding: 10px 20px;
+      transition: opacity 0.2s;
+      width: 100%;
+    }
+    .btn-primary  { background: var(--accent); color: #0d1b2a; font-weight: 700; }
+    .btn-secondary{ background: #2a3f57;       color: var(--text); }
+    .btn-primary:hover, .btn-secondary:hover { opacity: 0.85; }
+    .settings-actions { display: flex; gap: 10px; }
+    .legend {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      font-size: 0.78rem;
+      color: var(--subtext);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legend-swatch {
+      width: 18px; height: 4px;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Connection status + settings toggle -->
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center">
+    <div id="status-bar">
+      <div id="status-dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+    <button id="settings-toggle" onclick="toggleSettings()">⚙ Settings</button>
+  </div>
+
+  <!-- Main card -->
+  <div class="card">
+
+    <!-- Compass display -->
+    <div id="compass-wrap">
+      <svg id="compass-svg" viewBox="0 0 240 240">
+        <!-- Outer ring -->
+        <circle cx="120" cy="120" r="116" fill="none" stroke="#2a3f57" stroke-width="3"/>
+        <!-- Tick marks & cardinal labels -->
+        <g id="ticks"></g>
+
+        <!-- Target needle (blue) -->
+        <g id="needle-target">
+          <!-- Shaft -->
+          <line x1="120" y1="120" x2="120" y2="18" stroke="#00b4d8" stroke-width="3" stroke-linecap="round"/>
+          <!-- Arrowhead -->
+          <polygon points="120,10 114,26 126,26" fill="#00b4d8"/>
+          <!-- Tail -->
+          <line x1="120" y1="120" x2="120" y2="148" stroke="#00b4d8" stroke-width="2" opacity="0.5"/>
+        </g>
+
+        <!-- Current needle (orange) -->
+        <g id="needle-current">
+          <line x1="120" y1="120" x2="120" y2="28" stroke="#f77f00" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
+          <polygon points="120,20 115,34 125,34" fill="#f77f00" opacity="0.85"/>
+          <line x1="120" y1="120" x2="120" y2="144" stroke="#f77f00" stroke-width="1.5" opacity="0.4"/>
+        </g>
+
+        <!-- Centre dot -->
+        <circle cx="120" cy="120" r="6" fill="#0d1b2a" stroke="#4a6480" stroke-width="2"/>
+      </svg>
+    </div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#00b4d8"></div>
+        Target
+      </div>
+      <div class="legend-item">
+        <div class="legend-swatch" style="background:#f77f00"></div>
+        Current
+      </div>
+    </div>
+
+    <!-- Angle readouts -->
+    <div class="readouts">
+      <div class="readout">
+        <div class="readout-label">Target</div>
+        <div class="readout-value target" id="target-display">0.0<span class="readout-unit">°</span></div>
+      </div>
+      <div class="readout">
+        <div class="readout-label">Current</div>
+        <div class="readout-value current" id="current-display">—<span class="readout-unit">°</span></div>
+      </div>
+    </div>
+
+    <!-- Angle slider -->
+    <div class="slider-section">
+      <div class="slider-row">
+        <span class="slider-label">0°</span>
+        <input type="range" id="angle-slider" min="0" max="360" step="0.5" value="0" />
+        <span class="slider-label">360°</span>
+      </div>
+    </div>
+
+
+  </div><!-- /card -->
+
+  <!-- Settings panel -->
+  <div id="settings-panel" class="card">
+
+    <div class="settings-group">
+      <div class="settings-title">PID Controller</div>
+      <div class="settings-row">
+        <span class="settings-label">Kp (Proportional)</span>
+        <input type="number" id="kp-input" class="settings-input" step="0.1" min="0.1" max="100">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Ki (Integral)</span>
+        <input type="number" id="ki-input" class="settings-input" step="0.001" min="0" max="10">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Kd (Derivative)</span>
+        <input type="number" id="kd-input" class="settings-input" step="0.01" min="0" max="50">
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Deadband (°)</span>
+        <input type="number" id="deadband-input" class="settings-input" step="0.5" min="0" max="45">
+      </div>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <div class="settings-group">
+      <div class="settings-title">North Trim</div>
+      <div class="settings-row">
+        <span class="settings-label">Trim Offset (°)</span>
+        <input type="number" id="north-trim-input" class="settings-input" step="0.1" min="0" max="360">
+      </div>
+      <button class="btn-secondary" onclick="setCurrentAsNorth()">Set Current Direction as North</button>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <div class="settings-actions">
+      <button class="btn-primary"   onclick="saveSettings()">Save</button>
+      <button class="btn-secondary" onclick="toggleSettings()">Cancel</button>
+    </div>
+
+  </div><!-- /settings-panel -->
+
+  <script>
+    // ── Build compass tick marks and cardinal labels ──────────────────────
+    (function buildTicks() {
+      const g = document.getElementById('ticks');
+      const cx = 120, cy = 120, r = 108;
+      const cardinals = { 0:'N', 90:'E', 180:'S', 270:'W' };
+      for (let deg = 0; deg < 360; deg += 5) {
+        const rad = (deg - 90) * Math.PI / 180;
+        const isMajor = deg % 45 === 0;
+        const isCardinal = deg % 90 === 0;
+        const inner = isCardinal ? r - 18 : (isMajor ? r - 12 : r - 7);
+        const x1 = cx + Math.cos(rad) * r;
+        const y1 = cy + Math.sin(rad) * r;
+        const x2 = cx + Math.cos(rad) * inner;
+        const y2 = cy + Math.sin(rad) * inner;
+        const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+        line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+        line.setAttribute('stroke', isCardinal ? '#4a8caa' : (isMajor ? '#2a5068' : '#1e3a50'));
+        line.setAttribute('stroke-width', isCardinal ? 2 : (isMajor ? 1.5 : 1));
+        g.appendChild(line);
+        if (isCardinal) {
+          const lx = cx + Math.cos(rad) * (inner - 10);
+          const ly = cy + Math.sin(rad) * (inner - 10);
+          const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+          txt.setAttribute('x', lx); txt.setAttribute('y', ly);
+          txt.setAttribute('text-anchor','middle');
+          txt.setAttribute('dominant-baseline','middle');
+          txt.setAttribute('fill','#6aaccc');
+          txt.setAttribute('font-size','11');
+          txt.setAttribute('font-weight','bold');
+          txt.textContent = cardinals[deg];
+          g.appendChild(txt);
+        }
+      }
+    })();
+
+    // ── State ─────────────────────────────────────────────────────────────
+    let targetAngle  = 0;
+    let currentAngle = 0;   // display angle (trim-adjusted)
+    let rawCurrentAngle = 0;// raw angle from server (before trim)
+    let northTrim    = 0;   // trim offset loaded from /settings
+    let ws;
+    let reconnectTimer = null;
+
+    // ── DOM refs ──────────────────────────────────────────────────────────
+    const slider         = document.getElementById('angle-slider');
+    const targetDisplay  = document.getElementById('target-display');
+    const currentDisplay = document.getElementById('current-display');
+    const needleTarget   = document.getElementById('needle-target');
+    const needleCurrent  = document.getElementById('needle-current');
+    const statusDot      = document.getElementById('status-dot');
+    const statusText     = document.getElementById('status-text');
+
+    // ── Trim helpers ──────────────────────────────────────────────────────
+    // Raw motor angle → display heading (subtract trim)
+    function applyTrim(rawDeg, trim) {
+      return ((rawDeg - trim) % 360 + 360) % 360;
+    }
+    // Display heading → raw motor angle (add trim back)
+    function removeTrim(displayDeg, trim) {
+      return ((displayDeg + trim) % 360 + 360) % 360;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    // Track continuous (unbounded) needle angles so CSS transitions always
+    // take the short path across the 0/360 boundary.
+    let needleTargetDeg  = 0;
+    let needleCurrentDeg = 0;
+
+    function setNeedleAngle(el, prevDeg, newRawDeg) {
+      // Find the shortest delta from the previous continuous angle
+      let delta = ((newRawDeg - prevDeg) % 360 + 540) % 360 - 180;
+      const continuous = prevDeg + delta;
+      el.style.transform = `rotate(${continuous}deg)`;
+      return continuous;
+    }
+
+    function updateUI(target, current) {
+      // Normalise to [0, 360) for display and raw needle input
+      target  = ((target  % 360) + 360) % 360;
+      current = ((current % 360) + 360) % 360;
+      targetDisplay.innerHTML  = target.toFixed(1)  + '<span class="readout-unit">°</span>';
+      currentDisplay.innerHTML = current.toFixed(1) + '<span class="readout-unit">°</span>';
+      needleTargetDeg  = setNeedleAngle(needleTarget,  needleTargetDeg,  target);
+      needleCurrentDeg = setNeedleAngle(needleCurrent, needleCurrentDeg, current);
+    }
+
+    function sendAngle(displayDeg) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        // Convert display heading to raw motor angle before sending
+        const rawDeg = removeTrim(displayDeg, northTrim);
+        ws.send(JSON.stringify({ angle: rawDeg }));
+      }
+    }
+
+    function setAngle(deg) {
+      deg = Math.max(0, Math.min(360, deg));
+      targetAngle = deg;
+      slider.value = deg;
+      updateUI(deg, currentAngle);
+      sendAngle(deg);
+    }
+
+    // ── Slider ────────────────────────────────────────────────────────────
+    slider.addEventListener('input', function () {
+      const deg = parseFloat(this.value);
+      targetAngle = deg;
+      updateUI(deg, currentAngle);
+    });
+    slider.addEventListener('change', function () {
+      sendAngle(parseFloat(this.value));
+    });
+
+    // ── WebSocket ─────────────────────────────────────────────────────────
+    let connectTimeoutTimer = null;
+
+    function connect() {
+      // Cancel any pending retry or connect-timeout timer.
+      if (reconnectTimer)     { clearTimeout(reconnectTimer);     reconnectTimer     = null; }
+      if (connectTimeoutTimer){ clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+
+      // Silence and close any existing socket before creating a new one.
+      // Without this, a stale close/error event from the old socket can call
+      // connect() again and double-up reconnect timers (the refresh-then-
+      // disconnected bug: old socket closes *after* new one is already up).
+      if (ws) {
+        ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      }
+
+      const host = window.location.hostname;
+      ws = new WebSocket('ws://' + host + '/ws');
+
+      // Safety net: if still CONNECTING after 5 s, give up and retry.
+      // Catches the rare case where the TCP handshake succeeds but the
+      // WebSocket upgrade hangs (can happen on a quick page refresh while
+      // the firmware still holds the old TCP socket in TIME_WAIT).
+      connectTimeoutTimer = setTimeout(function () {
+        if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();
+      }, 5000);
+
+      ws.onopen = function () {
+        if (connectTimeoutTimer) { clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+        statusDot.classList.add('connected');
+        statusText.textContent = 'Connected';
+      };
+
+      ws.onclose = function () {
+        statusDot.classList.remove('connected');
+        statusText.textContent = 'Disconnected – reconnecting…';
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = function () {
+        ws.close();
+      };
+
+      ws.onmessage = function (evt) {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.current !== undefined) {
+            rawCurrentAngle = data.current;
+            currentAngle = applyTrim(data.current, northTrim);
+          }
+          if (data.target !== undefined) {
+            // Convert raw motor target back to display angle for the slider
+            targetAngle  = applyTrim(data.target, northTrim);
+            slider.value = targetAngle;
+          }
+          updateUI(targetAngle, currentAngle);
+        } catch (e) {
+          console.warn('Failed to parse WS message:', evt.data);
+        }
+      };
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────
+    updateUI(0, 0);
+    loadSettings();
+    connect();
+
+    // ── Settings ──────────────────────────────────────────────────────────
+    function toggleSettings() {
+      const panel = document.getElementById('settings-panel');
+      const isOpen = panel.style.display === 'flex';
+      if (!isOpen) loadSettings();
+      panel.style.display = isOpen ? 'none' : 'flex';
+    }
+
+    function loadSettings() {
+      fetch('/settings')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('kp-input').value        = data.kp;
+          document.getElementById('ki-input').value        = data.ki;
+          document.getElementById('kd-input').value        = data.kd;
+          document.getElementById('deadband-input').value  = data.deadband;
+          document.getElementById('north-trim-input').value= data.northTrim;
+          // Apply the loaded trim to current display
+          northTrim    = parseFloat(data.northTrim) || 0;
+          currentAngle = applyTrim(rawCurrentAngle, northTrim);
+          updateUI(targetAngle, currentAngle);
+        })
+        .catch(function(e) { console.warn('Failed to load settings:', e); });
+    }
+
+    function saveSettings() {
+      const payload = {
+        kp:        parseFloat(document.getElementById('kp-input').value),
+        ki:        parseFloat(document.getElementById('ki-input').value),
+        kd:        parseFloat(document.getElementById('kd-input').value),
+        deadband:  parseFloat(document.getElementById('deadband-input').value),
+        northTrim: parseFloat(document.getElementById('north-trim-input').value)
+      };
+      fetch('/settings', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+      })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.ok) {
+            northTrim    = payload.northTrim;
+            currentAngle = applyTrim(rawCurrentAngle, northTrim);
+            updateUI(targetAngle, currentAngle);
+            document.getElementById('settings-panel').style.display = 'none';
+          }
+        })
+        .catch(function(e) { console.warn('Failed to save settings:', e); });
+    }
+
+    function setCurrentAsNorth() {
+      // Set the trim so that the current raw motor angle becomes heading 0°
+      document.getElementById('north-trim-input').value = rawCurrentAngle.toFixed(1);
+    }
+
+    // ── Whole-screen swipe to adjust angle ────────────────────────────────
+    // Swiping left/right anywhere on the page nudges the target angle.
+    (function setupSwipe() {
+      const PIXELS_PER_DEGREE = 3; // px of horizontal swipe = 1 degree
+      let touchStartX = null;
+      let lastSentX   = null;
+
+      document.addEventListener('touchstart', function (e) {
+        // Ignore touches directly on the slider (let it handle itself)
+        if (e.target === slider) return;
+        touchStartX = e.touches[0].clientX;
+        lastSentX   = touchStartX;
+      }, { passive: true });
+
+      document.addEventListener('touchmove', function (e) {
+        if (touchStartX === null) return;
+        if (e.target === slider) return;
+        const x     = e.touches[0].clientX;
+        const delta = (x - lastSentX) / PIXELS_PER_DEGREE;
+        if (Math.abs(delta) >= 1) {
+          const newAngle = ((targetAngle + delta) % 360 + 360) % 360;
+          targetAngle  = newAngle;
+          slider.value = newAngle;
+          updateUI(newAngle, currentAngle);
+          sendAngle(newAngle);
+          lastSentX = x;
+        }
+      }, { passive: true });
+
+      document.addEventListener('touchend', function () {
+        touchStartX = null;
+        lastSentX   = null;
+      }, { passive: true });
+    })();
+
+    // ── Prevent phone screen from sleeping ───────────────────────────────
+    // Uses a silent looping video (the only approach that works on HTTP,
+    // which is what the ESP32 serves - Wake Lock API requires HTTPS).
+    (function noSleep() {
+      const v = document.createElement('video');
+      // Both attribute AND property required for reliable muting across browsers
+      v.setAttribute('playsinline', '');
+      v.setAttribute('webkit-playsinline', '');
+      v.setAttribute('muted', '');
+      v.setAttribute('loop', '');
+      v.muted  = true;
+      v.volume = 0;
+      // Must not be display:none or opacity:0 — iOS won't play invisible video.
+      // Position off-screen so it is technically visible but not seen.
+      v.style.cssText = 'position:fixed;top:-2px;left:-2px;width:2px;height:2px;pointer-events:none;';
+      v.src = 'data:video/mp4;base64,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';
+      document.body.appendChild(v);
+
+      function tryPlay() { v.play().catch(function(){}); }
+
+      // Start on first touch (browsers require a user gesture before autoplay)
+      document.addEventListener('touchstart', tryPlay, { passive: true, once: true });
+
+      // If the video stops for any reason, restart it
+      v.addEventListener('pause', tryPlay);
+      v.addEventListener('ended', tryPlay);
+
+      // Re-attempt when page becomes visible (e.g. returning from another app)
+      document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible') tryPlay();
+      });
+    })();
+
+    // ── Reconnect on screen-wake or network restore ────────────────────────
+    // Mobile browsers freeze JS (and WebSocket events) while the screen is
+    // locked. On wake, bypass the 3-second retry timer and reconnect at once.
+    function reconnectIfNeeded() {
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connect();
+      }
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') reconnectIfNeeded();
+    });
+    window.addEventListener('online', reconnectIfNeeded);
+  </script>
+</body>
+</html>
