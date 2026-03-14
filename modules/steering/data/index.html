@@ -3,28 +3,19 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sauna Boat – Auto Steering</title>
+  <title>Sauna Boat – Steering</title>
   <style>
     :root {
-      --bg:        #0d1b2a;
-      --panel:     #1b2d42;
-      --accent:    #00b4d8;
-      --accent2:   #f77f00;
-      --text:      #e0e0e0;
-      --subtext:   #8fa8c0;
-      --green:     #4ade80;
-      --red:       #f87171;
+      --bg:      #0d1b2a;
+      --panel:   #1b2d42;
+      --accent:  #00b4d8;
+      --text:    #e0e0e0;
+      --subtext: #8fa8c0;
+      --green:   #4ade80;
+      --red:     #f87171;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
-
-    /* Prevent accidental text selection during swipe gestures */
-    body, .card, .readouts, .readout, .legend, .presets, header, #status-bar {
-      -webkit-user-select: none;
-      user-select: none;
-    }
-    /* Keep text selectable only on elements that need it */
-    input[type="range"] { -webkit-user-select: auto; user-select: auto; }
 
     body {
       font-family: 'Segoe UI', Arial, sans-serif;
@@ -36,6 +27,8 @@
       align-items: center;
       padding: 24px 16px 40px;
       gap: 24px;
+      -webkit-user-select: none;
+      user-select: none;
     }
 
     /* ── Status pill ── */
@@ -57,458 +50,374 @@
     #status-dot.connected { background: var(--green); }
     #status-text { color: var(--subtext); }
 
-    /* ── Compass card ── */
+    /* ── Main card ── */
     .card {
+      background: var(--panel);
+      border-radius: 16px;
+      padding: 28px 24px;
+      width: 100%;
+      max-width: 380px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+    }
+    .card h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--subtext);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    /* ── Joystick ── */
+    #joystick-wrap {
+      position: relative;
+      width: 200px;
+      height: 200px;
+      border-radius: 50%;
+      background: rgba(0, 180, 216, 0.07);
+      border: 2px solid rgba(0, 180, 216, 0.35);
+      touch-action: none;
+      cursor: grab;
+    }
+    #joystick-wrap:active { cursor: grabbing; }
+
+    /* Cross-hair guide lines */
+    #joystick-wrap::before,
+    #joystick-wrap::after {
+      content: '';
+      position: absolute;
+      background: rgba(0, 180, 216, 0.15);
+    }
+    #joystick-wrap::before {
+      width: 1px; height: 100%;
+      left: 50%; top: 0;
+    }
+    #joystick-wrap::after {
+      width: 100%; height: 1px;
+      top: 50%; left: 0;
+    }
+
+    #joystick-puck {
+      position: absolute;
+      width: 70px;
+      height: 70px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 38% 38%, #29d6f5, var(--accent));
+      box-shadow: 0 0 18px rgba(0, 180, 216, 0.55);
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      will-change: transform;
+    }
+    #joystick-puck.snap {
+      transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+
+    /* ── Speed readout ── */
+    #speed-display {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: var(--accent);
+      min-width: 120px;
+      text-align: center;
+    }
+    #speed-display.active { color: #fff; }
+
+    /* ── Direction label ── */
+    #direction-label {
+      font-size: 0.8rem;
+      color: var(--subtext);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      height: 1em;
+    }
+
+    /* ── Settings button ── */
+    #settings-btn {
+      background: var(--panel);
+      color: var(--subtext);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 8px 18px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    #settings-btn:hover { color: var(--text); border-color: var(--accent); }
+
+    /* ── Settings panel ── */
+    #settings-panel {
+      display: none;
+      flex-direction: column;
+      gap: 14px;
       background: var(--panel);
       border-radius: 16px;
       padding: 24px;
       width: 100%;
-      max-width: 420px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 20px;
+      max-width: 380px;
     }
-
-    /* ── SVG compass ── */
-    #compass-wrap {
-      position: relative;
-      width: 240px;
-      height: 240px;
-    }
-    #compass-svg {
-      width: 100%; height: 100%;
-    }
-    /* target needle (accent blue) */
-    #needle-target {
-      transform-origin: 120px 120px;
-      transition: transform 0.3s ease;
-    }
-    /* current needle (orange) */
-    #needle-current {
-      transform-origin: 120px 120px;
-      transition: transform 0.15s linear;
-    }
-
-    /* ── Angle readouts ── */
-    .readouts {
-      display: flex;
-      gap: 24px;
-      justify-content: center;
-      width: 100%;
-    }
-    .readout {
-      text-align: center;
-      flex: 1;
-    }
-    .readout-label {
-      font-size: 0.72rem;
+    #settings-panel h3 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--subtext);
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--subtext);
-      margin-bottom: 4px;
+      letter-spacing: 0.05em;
     }
-    .readout-value {
-      font-size: 2rem;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-    }
-    .readout-value.target  { color: var(--accent); }
-    .readout-value.current { color: var(--accent2); }
-    .readout-unit {
-      font-size: 0.85rem;
-      color: var(--subtext);
-      margin-left: 2px;
-    }
-
-    /* ── Slider section ── */
-    .slider-section {
-      width: 100%;
+    .field {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 6px;
     }
-    .slider-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .slider-label {
+    .field label {
       font-size: 0.8rem;
       color: var(--subtext);
-      min-width: 28px;
-      text-align: right;
     }
-    input[type="range"] {
-      flex: 1;
-      -webkit-appearance: none;
-      height: 6px;
-      border-radius: 3px;
-      background: #2a3f57;
-      outline: none;
-      cursor: pointer;
-    }
-    input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none;
-      width: 22px; height: 22px;
-      border-radius: 50%;
-      background: var(--accent);
-      border: 3px solid var(--bg);
-      box-shadow: 0 0 6px rgba(0,180,216,0.6);
-      cursor: pointer;
-    }
-    input[type="range"]::-moz-range-thumb {
-      width: 22px; height: 22px;
-      border-radius: 50%;
-      background: var(--accent);
-      border: 3px solid var(--bg);
-      cursor: pointer;
-    }
-
-    /* ── Settings button ── */
-    #settings-toggle {
-      background: var(--panel);
-      border: 1px solid #2a3f57;
-      border-radius: 999px;
-      color: var(--subtext);
-      cursor: pointer;
-      font-size: 0.82rem;
-      padding: 6px 14px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: color 0.2s, border-color 0.2s;
-    }
-    #settings-toggle:hover { color: var(--accent); border-color: var(--accent); }
-
-    /* ── Settings panel ── */
-    #settings-panel {
-      width: 100%;
-      max-width: 420px;
-      display: none;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .settings-title {
-      font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--accent);
-      margin-bottom: 8px;
-    }
-    .settings-group {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .settings-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .settings-label {
-      font-size: 0.82rem;
-      color: var(--subtext);
-      flex: 1;
-    }
-    .settings-input {
-      width: 90px;
-      background: #0d1b2a;
-      border: 1px solid #2a3f57;
-      border-radius: 6px;
+    .field input[type="number"], .field input[type="range"] {
+      background: var(--bg);
       color: var(--text);
-      font-size: 0.9rem;
-      padding: 6px 8px;
-      text-align: right;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 0.95rem;
+      width: 100%;
       -webkit-user-select: text;
       user-select: text;
     }
-    .settings-input:focus { outline: none; border-color: var(--accent); }
-    .settings-divider {
-      height: 1px;
-      background: #2a3f57;
-    }
-    .btn-primary, .btn-secondary {
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 0.85rem;
-      padding: 10px 20px;
-      transition: opacity 0.2s;
-      width: 100%;
-    }
-    .btn-primary  { background: var(--accent); color: #0d1b2a; font-weight: 700; }
-    .btn-secondary{ background: #2a3f57;       color: var(--text); }
-    .btn-primary:hover, .btn-secondary:hover { opacity: 0.85; }
-    .settings-actions { display: flex; gap: 10px; }
-    .legend {
-      display: flex;
-      gap: 20px;
-      justify-content: center;
-      font-size: 0.78rem;
+    .field input[type="range"] { padding: 4px 0; cursor: pointer; }
+    .field .hint {
+      font-size: 0.75rem;
       color: var(--subtext);
     }
-    .legend-item {
+    .btn-row {
       display: flex;
-      align-items: center;
-      gap: 6px;
+      gap: 10px;
+      justify-content: flex-end;
     }
-    .legend-swatch {
-      width: 18px; height: 4px;
-      border-radius: 2px;
+    .btn {
+      border: none;
+      border-radius: 8px;
+      padding: 8px 20px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      font-weight: 600;
     }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-secondary { background: rgba(255,255,255,0.08); color: var(--text); }
   </style>
 </head>
 <body>
 
-  <!-- Connection status + settings toggle -->
-  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center">
-    <div id="status-bar">
-      <div id="status-dot"></div>
-      <span id="status-text">Connecting…</span>
-    </div>
-    <button id="settings-toggle" onclick="toggleSettings()">⚙ Settings</button>
+  <!-- Status bar -->
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
   </div>
 
-  <!-- Main card -->
+  <!-- Joystick card -->
   <div class="card">
+    <h2>Steering Control</h2>
 
-    <!-- Compass display -->
-    <div id="compass-wrap">
-      <svg id="compass-svg" viewBox="0 0 240 240">
-        <!-- Outer ring -->
-        <circle cx="120" cy="120" r="116" fill="none" stroke="#2a3f57" stroke-width="3"/>
-        <!-- Tick marks & cardinal labels -->
-        <g id="ticks"></g>
-
-        <!-- Target needle (blue) -->
-        <g id="needle-target">
-          <!-- Shaft -->
-          <line x1="120" y1="120" x2="120" y2="18" stroke="#00b4d8" stroke-width="3" stroke-linecap="round"/>
-          <!-- Arrowhead -->
-          <polygon points="120,10 114,26 126,26" fill="#00b4d8"/>
-          <!-- Tail -->
-          <line x1="120" y1="120" x2="120" y2="148" stroke="#00b4d8" stroke-width="2" opacity="0.5"/>
-        </g>
-
-        <!-- Current needle (orange) -->
-        <g id="needle-current">
-          <line x1="120" y1="120" x2="120" y2="28" stroke="#f77f00" stroke-width="2.5" stroke-linecap="round" opacity="0.85"/>
-          <polygon points="120,20 115,34 125,34" fill="#f77f00" opacity="0.85"/>
-          <line x1="120" y1="120" x2="120" y2="144" stroke="#f77f00" stroke-width="1.5" opacity="0.4"/>
-        </g>
-
-        <!-- Centre dot -->
-        <circle cx="120" cy="120" r="6" fill="#0d1b2a" stroke="#4a6480" stroke-width="2"/>
-      </svg>
+    <div id="joystick-wrap">
+      <div id="joystick-puck"></div>
     </div>
 
-    <!-- Legend -->
-    <div class="legend">
-      <div class="legend-item">
-        <div class="legend-swatch" style="background:#00b4d8"></div>
-        Target
-      </div>
-      <div class="legend-item">
-        <div class="legend-swatch" style="background:#f77f00"></div>
-        Current
-      </div>
+    <div id="speed-display">0%</div>
+    <div id="direction-label">&nbsp;</div>
+  </div>
+
+  <!-- Settings -->
+  <button id="settings-btn" onclick="toggleSettings()">⚙ Settings</button>
+
+  <div id="settings-panel">
+    <h3>Settings</h3>
+    <div class="field">
+      <label for="maxspeed-range">Max speed (PWM 0 – 1023)</label>
+      <input type="range" id="maxspeed-range" min="0" max="1023" step="1" value="512"
+             oninput="document.getElementById('maxspeed-num').value=this.value" />
+      <input type="number" id="maxspeed-num" min="0" max="1023" step="1" value="512"
+             oninput="document.getElementById('maxspeed-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">PWM output when joystick is fully deflected.</span>
     </div>
-
-    <!-- Angle readouts -->
-    <div class="readouts">
-      <div class="readout">
-        <div class="readout-label">Target</div>
-        <div class="readout-value target" id="target-display">0.0<span class="readout-unit">°</span></div>
-      </div>
-      <div class="readout">
-        <div class="readout-label">Current</div>
-        <div class="readout-value current" id="current-display">—<span class="readout-unit">°</span></div>
-      </div>
+    <div class="field">
+      <label for="snaptimeout-range">Inactivity snap-back (50 – 5000 ms)</label>
+      <input type="range" id="snaptimeout-range" min="50" max="5000" step="50" value="100"
+             oninput="document.getElementById('snaptimeout-num').value=this.value" />
+      <input type="number" id="snaptimeout-num" min="50" max="5000" step="50" value="100"
+             oninput="document.getElementById('snaptimeout-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">Joystick recenters if touch stops moving for this long.</span>
     </div>
-
-    <!-- Angle slider -->
-    <div class="slider-section">
-      <div class="slider-row">
-        <span class="slider-label">0°</span>
-        <input type="range" id="angle-slider" min="0" max="360" step="0.5" value="0" />
-        <span class="slider-label">360°</span>
-      </div>
+    <div class="field">
+      <label for="rampms-range">Speed ramp time (0 – 2000 ms)</label>
+      <input type="range" id="rampms-range" min="0" max="2000" step="50" value="500"
+             oninput="document.getElementById('rampms-num').value=this.value" />
+      <input type="number" id="rampms-num" min="0" max="2000" step="50" value="500"
+             oninput="document.getElementById('rampms-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">Time to ramp from stop to full speed. 0 = instant.</span>
     </div>
-
-
-  </div><!-- /card -->
-
-  <!-- Settings panel -->
-  <div id="settings-panel" class="card">
-
-    <div class="settings-group">
-      <div class="settings-title">PID Controller</div>
-      <div class="settings-row">
-        <span class="settings-label">Kp (Proportional)</span>
-        <input type="number" id="kp-input" class="settings-input" step="0.1" min="0.1" max="100">
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">Ki (Integral)</span>
-        <input type="number" id="ki-input" class="settings-input" step="0.001" min="0" max="10">
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">Kd (Derivative)</span>
-        <input type="number" id="kd-input" class="settings-input" step="0.01" min="0" max="50">
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">Deadband (°)</span>
-        <input type="number" id="deadband-input" class="settings-input" step="0.5" min="0" max="45">
-      </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
+      <button class="btn btn-primary"   onclick="saveSettings()">Save</button>
     </div>
-
-    <div class="settings-divider"></div>
-
-    <div class="settings-group">
-      <div class="settings-title">North Trim</div>
-      <div class="settings-row">
-        <span class="settings-label">Trim Offset (°)</span>
-        <input type="number" id="north-trim-input" class="settings-input" step="0.1" min="0" max="360">
-      </div>
-      <button class="btn-secondary" onclick="setCurrentAsNorth()">Set Current Direction as North</button>
-    </div>
-
-    <div class="settings-divider"></div>
-
-    <div class="settings-actions">
-      <button class="btn-primary"   onclick="saveSettings()">Save</button>
-      <button class="btn-secondary" onclick="toggleSettings()">Cancel</button>
-    </div>
-
-  </div><!-- /settings-panel -->
+  </div>
 
   <script>
-    // ── Build compass tick marks and cardinal labels ──────────────────────
-    (function buildTicks() {
-      const g = document.getElementById('ticks');
-      const cx = 120, cy = 120, r = 108;
-      const cardinals = { 0:'N', 90:'E', 180:'S', 270:'W' };
-      for (let deg = 0; deg < 360; deg += 5) {
-        const rad = (deg - 90) * Math.PI / 180;
-        const isMajor = deg % 45 === 0;
-        const isCardinal = deg % 90 === 0;
-        const inner = isCardinal ? r - 18 : (isMajor ? r - 12 : r - 7);
-        const x1 = cx + Math.cos(rad) * r;
-        const y1 = cy + Math.sin(rad) * r;
-        const x2 = cx + Math.cos(rad) * inner;
-        const y2 = cy + Math.sin(rad) * inner;
-        const line = document.createElementNS('http://www.w3.org/2000/svg','line');
-        line.setAttribute('x1', x1); line.setAttribute('y1', y1);
-        line.setAttribute('x2', x2); line.setAttribute('y2', y2);
-        line.setAttribute('stroke', isCardinal ? '#4a8caa' : (isMajor ? '#2a5068' : '#1e3a50'));
-        line.setAttribute('stroke-width', isCardinal ? 2 : (isMajor ? 1.5 : 1));
-        g.appendChild(line);
-        if (isCardinal) {
-          const lx = cx + Math.cos(rad) * (inner - 10);
-          const ly = cy + Math.sin(rad) * (inner - 10);
-          const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
-          txt.setAttribute('x', lx); txt.setAttribute('y', ly);
-          txt.setAttribute('text-anchor','middle');
-          txt.setAttribute('dominant-baseline','middle');
-          txt.setAttribute('fill','#6aaccc');
-          txt.setAttribute('font-size','11');
-          txt.setAttribute('font-weight','bold');
-          txt.textContent = cardinals[deg];
-          g.appendChild(txt);
-        }
-      }
-    })();
-
-    // ── State ─────────────────────────────────────────────────────────────
-    let targetAngle  = 0;
-    let currentAngle = 0;   // display angle (trim-adjusted)
-    let rawCurrentAngle = 0;// raw angle from server (before trim)
-    let northTrim    = 0;   // trim offset loaded from /settings
-    let ws;
-    let reconnectTimer = null;
+    // ── Constants ─────────────────────────────────────────────────────────
+    const PAD_RADIUS          = 100;   // half the 200 px pad
+    const PUCK_RADIUS         = 35;    // half the 70 px puck
+    const MAX_TRAVEL          = PAD_RADIUS - PUCK_RADIUS;   // 65 px
+    const SEND_THROTTLE_MS    = 50;    // max send rate while dragging (20 Hz)
+    const HEARTBEAT_INTERVAL_MS = 100; // keep-alive send interval (ms) — firmware watchdog is 200 ms
+    const RECONNECT_DELAY_MS  = 3000;  // wait before reconnect attempt (ms)
+    const SPEED_THRESHOLD     = 0.02;  // minimum speed to show direction label
 
     // ── DOM refs ──────────────────────────────────────────────────────────
-    const slider         = document.getElementById('angle-slider');
-    const targetDisplay  = document.getElementById('target-display');
-    const currentDisplay = document.getElementById('current-display');
-    const needleTarget   = document.getElementById('needle-target');
-    const needleCurrent  = document.getElementById('needle-current');
-    const statusDot      = document.getElementById('status-dot');
-    const statusText     = document.getElementById('status-text');
+    const pad         = document.getElementById('joystick-wrap');
+    const puck        = document.getElementById('joystick-puck');
+    const speedDisp   = document.getElementById('speed-display');
+    const dirLabel    = document.getElementById('direction-label');
+    const statusDot   = document.getElementById('status-dot');
+    const statusText  = document.getElementById('status-text');
 
-    // ── Trim helpers ──────────────────────────────────────────────────────
-    // Raw motor angle → display heading (subtract trim)
-    function applyTrim(rawDeg, trim) {
-      return ((rawDeg - trim) % 360 + 360) % 360;
-    }
-    // Display heading → raw motor angle (add trim back)
-    function removeTrim(displayDeg, trim) {
-      return ((displayDeg + trim) % 360 + 360) % 360;
-    }
+    // ── State ─────────────────────────────────────────────────────────────
+    let dragging          = false;
+    let currentSpeed      = 0;       // -1.0 … 1.0
+    let lastSendTime      = 0;
+    let ws                = null;
+    let reconnectTimer    = null;
+    let inactivityTimer   = null;    // auto-recenter if touch stops moving
+    let snapTimeoutMs     = 100;     // loaded from /settings (default 100 ms)
 
     // ── Helpers ───────────────────────────────────────────────────────────
-    // Track continuous (unbounded) needle angles so CSS transitions always
-    // take the short path across the 0/360 boundary.
-    let needleTargetDeg  = 0;
-    let needleCurrentDeg = 0;
-
-    function setNeedleAngle(el, prevDeg, newRawDeg) {
-      // Find the shortest delta from the previous continuous angle
-      let delta = ((newRawDeg - prevDeg) % 360 + 540) % 360 - 180;
-      const continuous = prevDeg + delta;
-      el.style.transform = `rotate(${continuous}deg)`;
-      return continuous;
+    function clampToPad(x, y) {
+      const dist = Math.sqrt(x * x + y * y);
+      if (dist > MAX_TRAVEL) {
+        return { x: (x / dist) * MAX_TRAVEL, y: (y / dist) * MAX_TRAVEL };
+      }
+      return { x, y };
     }
 
-    function updateUI(target, current) {
-      // Normalise to [0, 360) for display and raw needle input
-      target  = ((target  % 360) + 360) % 360;
-      current = ((current % 360) + 360) % 360;
-      targetDisplay.innerHTML  = target.toFixed(1)  + '<span class="readout-unit">°</span>';
-      currentDisplay.innerHTML = current.toFixed(1) + '<span class="readout-unit">°</span>';
-      needleTargetDeg  = setNeedleAngle(needleTarget,  needleTargetDeg,  target);
-      needleCurrentDeg = setNeedleAngle(needleCurrent, needleCurrentDeg, current);
+    function relativePos(e) {
+      const rect = pad.getBoundingClientRect();
+      const cx = rect.left + rect.width  / 2;
+      const cy = rect.top  + rect.height / 2;
+      return { x: e.clientX - cx, y: e.clientY - cy };
     }
 
-    function sendAngle(displayDeg) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        // Convert display heading to raw motor angle before sending
-        const rawDeg = removeTrim(displayDeg, northTrim);
-        ws.send(JSON.stringify({ angle: rawDeg }));
+    function updatePuck(rawX, rawY) {
+      const { x, y } = clampToPad(rawX, rawY);
+      puck.classList.remove('snap');
+      // Offset from centre expressed as CSS translate (centre of puck is at 50%/50%)
+      puck.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+
+      // Horizontal axis → steering speed
+      const speed = x / MAX_TRAVEL;
+      currentSpeed = speed;
+      refreshSpeedDisplay(speed);
+      throttledSend(speed);
+    }
+
+    function refreshSpeedDisplay(speed) {
+      const pct = Math.round(Math.abs(speed) * 100);
+      speedDisp.textContent = pct + '%';
+      speedDisp.classList.toggle('active', pct > 0);
+      if (speed > SPEED_THRESHOLD)        dirLabel.textContent = '▶  Steer right';
+      else if (speed < -SPEED_THRESHOLD)  dirLabel.textContent = '◀  Steer left';
+      else                                dirLabel.textContent  = '';
+    }
+
+    function throttledSend(speed) {
+      const now = Date.now();
+      if (now - lastSendTime >= SEND_THROTTLE_MS) {
+        sendSpeed(speed);
+        lastSendTime = now;
       }
     }
 
-    function setAngle(deg) {
-      deg = Math.max(0, Math.min(360, deg));
-      targetAngle = deg;
-      slider.value = deg;
-      updateUI(deg, currentAngle);
-      sendAngle(deg);
+    function sendSpeed(speed) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ speed: speed }));
+      }
     }
 
-    // ── Slider ────────────────────────────────────────────────────────────
-    slider.addEventListener('input', function () {
-      const deg = parseFloat(this.value);
-      targetAngle = deg;
-      updateUI(deg, currentAngle);
+    function snapBack() {
+      puck.classList.add('snap');
+      puck.style.transform = 'translate(-50%, -50%)';
+      currentSpeed = 0;
+      refreshSpeedDisplay(0);
+      sendSpeed(0);
+      lastSendTime = Date.now();
+      clearInactivityTimer();
+    }
+
+    // ── Inactivity snap-back ───────────────────────────────────────────────
+    // If the touch/pointer stops moving while dragging, treat it as a release.
+    function resetInactivityTimer() {
+      clearInactivityTimer();
+      if (!dragging) return;
+      inactivityTimer = setTimeout(function () {
+        if (dragging) {
+          dragging = false;
+          snapBack();
+        }
+      }, snapTimeoutMs);
+    }
+
+    function clearInactivityTimer() {
+      if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
+    }
+
+    // ── Joystick: pointer events (mouse + touch + stylus unified) ─────────
+    // Using the Pointer Events API ensures pointercancel fires when an OS
+    // gesture, notification, or other interruption steals the touch — which
+    // would silently leave the joystick stuck under the old touch/mouse model.
+    // setPointerCapture guarantees pointerup/pointercancel are always delivered
+    // even when the finger moves outside the element.
+    pad.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      pad.setPointerCapture(e.pointerId);
+      dragging = true;
+      const { x, y } = relativePos(e);
+      updatePuck(x, y);
+      resetInactivityTimer();
     });
-    slider.addEventListener('change', function () {
-      sendAngle(parseFloat(this.value));
+
+    pad.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      e.preventDefault();
+      const { x, y } = relativePos(e);
+      updatePuck(x, y);
+      resetInactivityTimer();
     });
+
+    function onPointerEnd() {
+      if (!dragging) return;
+      dragging = false;
+      clearInactivityTimer();
+      snapBack();
+    }
+
+    pad.addEventListener('pointerup',     onPointerEnd);
+    pad.addEventListener('pointercancel', onPointerEnd);  // OS/browser interruption
+
+    // ── Heartbeat ─────────────────────────────────────────────────────────
+    // Keep the firmware watchdog alive when joystick is held non-zero.
+    setInterval(function () {
+      sendSpeed(currentSpeed);
+    }, HEARTBEAT_INTERVAL_MS);
 
     // ── WebSocket ─────────────────────────────────────────────────────────
-    let connectTimeoutTimer = null;
-
     function connect() {
-      // Cancel any pending retry or connect-timeout timer.
-      if (reconnectTimer)     { clearTimeout(reconnectTimer);     reconnectTimer     = null; }
-      if (connectTimeoutTimer){ clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
+      // Cancel any pending retry timer.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-      // Silence and close any existing socket before creating a new one.
-      // Without this, a stale close/error event from the old socket can call
-      // connect() again and double-up reconnect timers (the refresh-then-
-      // disconnected bug: old socket closes *after* new one is already up).
+      // Detach handlers from the old socket so stale close/error events
+      // can't race with the new connection and spawn extra retry timers.
       if (ws) {
         ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
@@ -519,16 +428,7 @@
       const host = window.location.hostname;
       ws = new WebSocket('ws://' + host + '/ws');
 
-      // Safety net: if still CONNECTING after 5 s, give up and retry.
-      // Catches the rare case where the TCP handshake succeeds but the
-      // WebSocket upgrade hangs (can happen on a quick page refresh while
-      // the firmware still holds the old TCP socket in TIME_WAIT).
-      connectTimeoutTimer = setTimeout(function () {
-        if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();
-      }, 5000);
-
       ws.onopen = function () {
-        if (connectTimeoutTimer) { clearTimeout(connectTimeoutTimer); connectTimeoutTimer = null; }
         statusDot.classList.add('connected');
         statusText.textContent = 'Connected';
       };
@@ -536,36 +436,21 @@
       ws.onclose = function () {
         statusDot.classList.remove('connected');
         statusText.textContent = 'Disconnected – reconnecting…';
-        reconnectTimer = setTimeout(connect, 3000);
+        snapBack();
+        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
       };
 
-      ws.onerror = function () {
-        ws.close();
-      };
+      ws.onerror = function () { ws.close(); };
 
-      ws.onmessage = function (evt) {
-        try {
-          const data = JSON.parse(evt.data);
-          if (data.current !== undefined) {
-            rawCurrentAngle = data.current;
-            currentAngle = applyTrim(data.current, northTrim);
-          }
-          if (data.target !== undefined) {
-            // Convert raw motor target back to display angle for the slider
-            targetAngle  = applyTrim(data.target, northTrim);
-            slider.value = targetAngle;
-          }
-          updateUI(targetAngle, currentAngle);
-        } catch (e) {
-          console.warn('Failed to parse WS message:', evt.data);
-        }
-      };
+      // Server broadcasts are intentionally ignored for speed state.
+      // The client is the sole authority on what speed it is commanding.
+      // Echoing server speed back into currentSpeed caused a race condition:
+      // after snapBack() the firmware could broadcast the stale non-zero speed
+      // just before it processed the speed=0 message, resetting currentSpeed to
+      // non-zero while the puck was already visually centred — and then the
+      // heartbeat would re-send that stale speed to the motor.
+      ws.onmessage = function () {};
     }
-
-    // ── Init ──────────────────────────────────────────────────────────────
-    updateUI(0, 0);
-    loadSettings();
-    connect();
 
     // ── Settings ──────────────────────────────────────────────────────────
     function toggleSettings() {
@@ -577,122 +462,66 @@
 
     function loadSettings() {
       fetch('/settings')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          document.getElementById('kp-input').value        = data.kp;
-          document.getElementById('ki-input').value        = data.ki;
-          document.getElementById('kd-input').value        = data.kd;
-          document.getElementById('deadband-input').value  = data.deadband;
-          document.getElementById('north-trim-input').value= data.northTrim;
-          // Apply the loaded trim to current display
-          northTrim    = parseFloat(data.northTrim) || 0;
-          currentAngle = applyTrim(rawCurrentAngle, northTrim);
-          updateUI(targetAngle, currentAngle);
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          const v = data.maxSpeed !== undefined ? data.maxSpeed : 512;
+          document.getElementById('maxspeed-range').value = v;
+          document.getElementById('maxspeed-num').value   = v;
+
+          const t = data.snapTimeout !== undefined ? data.snapTimeout : 100;
+          document.getElementById('snaptimeout-range').value = t;
+          document.getElementById('snaptimeout-num').value   = t;
+
+          const r = data.rampMs !== undefined ? data.rampMs : 500;
+          document.getElementById('rampms-range').value = r;
+          document.getElementById('rampms-num').value   = r;
         })
-        .catch(function(e) { console.warn('Failed to load settings:', e); });
+        .catch(function (e) { console.warn('Failed to load settings:', e); });
     }
 
     function saveSettings() {
-      const payload = {
-        kp:        parseFloat(document.getElementById('kp-input').value),
-        ki:        parseFloat(document.getElementById('ki-input').value),
-        kd:        parseFloat(document.getElementById('kd-input').value),
-        deadband:  parseFloat(document.getElementById('deadband-input').value),
-        northTrim: parseFloat(document.getElementById('north-trim-input').value)
-      };
+      const maxSpeed    = parseInt(document.getElementById('maxspeed-num').value, 10);
+      const snapTimeout = parseInt(document.getElementById('snaptimeout-num').value, 10);
+      const rampMs      = parseInt(document.getElementById('rampms-num').value, 10);
       fetch('/settings', {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(payload)
+        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs })
       })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
           if (data.ok) {
-            northTrim    = payload.northTrim;
-            currentAngle = applyTrim(rawCurrentAngle, northTrim);
-            updateUI(targetAngle, currentAngle);
+            snapTimeoutMs = snapTimeout;  // apply immediately
             document.getElementById('settings-panel').style.display = 'none';
           }
         })
-        .catch(function(e) { console.warn('Failed to save settings:', e); });
+        .catch(function (e) { console.warn('Failed to save settings:', e); });
     }
 
-    function setCurrentAsNorth() {
-      // Set the trim so that the current raw motor angle becomes heading 0°
-      document.getElementById('north-trim-input').value = rawCurrentAngle.toFixed(1);
-    }
-
-    // ── Whole-screen swipe to adjust angle ────────────────────────────────
-    // Swiping left/right anywhere on the page nudges the target angle.
-    (function setupSwipe() {
-      const PIXELS_PER_DEGREE = 3; // px of horizontal swipe = 1 degree
-      let touchStartX = null;
-      let lastSentX   = null;
-
-      document.addEventListener('touchstart', function (e) {
-        // Ignore touches directly on the slider (let it handle itself)
-        if (e.target === slider) return;
-        touchStartX = e.touches[0].clientX;
-        lastSentX   = touchStartX;
-      }, { passive: true });
-
-      document.addEventListener('touchmove', function (e) {
-        if (touchStartX === null) return;
-        if (e.target === slider) return;
-        const x     = e.touches[0].clientX;
-        const delta = (x - lastSentX) / PIXELS_PER_DEGREE;
-        if (Math.abs(delta) >= 1) {
-          const newAngle = ((targetAngle + delta) % 360 + 360) % 360;
-          targetAngle  = newAngle;
-          slider.value = newAngle;
-          updateUI(newAngle, currentAngle);
-          sendAngle(newAngle);
-          lastSentX = x;
-        }
-      }, { passive: true });
-
-      document.addEventListener('touchend', function () {
-        touchStartX = null;
-        lastSentX   = null;
-      }, { passive: true });
-    })();
-
-    // ── Prevent phone screen from sleeping ───────────────────────────────
-    // Uses a silent looping video (the only approach that works on HTTP,
-    // which is what the ESP32 serves - Wake Lock API requires HTTPS).
+    // ── No-sleep: keep screen on via looping silent video ─────────────────
     (function noSleep() {
       const v = document.createElement('video');
-      // Both attribute AND property required for reliable muting across browsers
       v.setAttribute('playsinline', '');
       v.setAttribute('webkit-playsinline', '');
       v.setAttribute('muted', '');
       v.setAttribute('loop', '');
       v.muted  = true;
       v.volume = 0;
-      // Must not be display:none or opacity:0 — iOS won't play invisible video.
-      // Position off-screen so it is technically visible but not seen.
       v.style.cssText = 'position:fixed;top:-2px;left:-2px;width:2px;height:2px;pointer-events:none;';
       v.src = 'data:video/mp4;base64,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';
       document.body.appendChild(v);
-
-      function tryPlay() { v.play().catch(function(){}); }
-
-      // Start on first touch (browsers require a user gesture before autoplay)
+      function tryPlay() { v.play().catch(function () {}); }
       document.addEventListener('touchstart', tryPlay, { passive: true, once: true });
-
-      // If the video stops for any reason, restart it
       v.addEventListener('pause', tryPlay);
       v.addEventListener('ended', tryPlay);
-
-      // Re-attempt when page becomes visible (e.g. returning from another app)
-      document.addEventListener('visibilitychange', function() {
+      document.addEventListener('visibilitychange', function () {
         if (document.visibilityState === 'visible') tryPlay();
       });
     })();
 
-    // ── Reconnect on screen-wake or network restore ────────────────────────
-    // Mobile browsers freeze JS (and WebSocket events) while the screen is
-    // locked. On wake, bypass the 3-second retry timer and reconnect at once.
+    // ── Reconnect on screen wake / network restore ─────────────────────────
+    // Mobile browsers freeze JS when the screen locks. On wake, attempt an
+    // immediate reconnect rather than waiting for the 3-second retry timer.
     function reconnectIfNeeded() {
       if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
         connect();
@@ -702,6 +531,18 @@
       if (document.visibilityState === 'visible') reconnectIfNeeded();
     });
     window.addEventListener('online', reconnectIfNeeded);
+
+    // ── Init ──────────────────────────────────────────────────────────────
+    // Load snapTimeout from firmware before connecting so the inactivity timer
+    // uses the persisted value immediately.
+    fetch('/settings')
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.snapTimeout !== undefined) snapTimeoutMs = data.snapTimeout;
+      })
+      .catch(function () {});  // non-fatal; default value is already set
+
+    connect();
   </script>
 </body>
 </html>
