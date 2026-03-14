@@ -15,15 +15,20 @@
 //
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
+//
+// Mesh: accepts MSG_SET_SPEED commands from any module over ESP-NOW.
+// The soft-AP is pinned to MESH_WIFI_CHANNEL so both share one radio channel.
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include "MotorUnit.h"
 #include "SparkFun_I2C_Mux_Arduino_Library.h"
+#include "mesh_protocol.h"
 
 // ---------------------------------------------------------------------------
 // WiFi Access Point credentials
@@ -68,6 +73,25 @@ static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
+
+// ---------------------------------------------------------------------------
+// ESP-NOW receive callback – runs in the WiFi driver task context.
+// Handles MSG_SET_SPEED from the controller module (or any future module).
+// Updating g_currentSpeed and g_lastCmdTime here is safe: both are 32-bit
+// aligned values and the ESP32 performs 32-bit loads/stores atomically.
+// ---------------------------------------------------------------------------
+static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) {
+    if (len < static_cast<int>(sizeof(MeshMessage))) return;
+    MeshMessage msg;
+    memcpy(&msg, data, sizeof(msg));
+
+    if (msg.type == MSG_SET_SPEED) {
+        float speed = constrain(msg.value1, -1.0f, 1.0f);
+        steeringMotor.setSpeed(speed);
+        g_currentSpeed = speed;
+        g_lastCmdTime  = millis();  // keep the watchdog alive
+    }
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket event handler
@@ -160,10 +184,19 @@ void setup() {
                   steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
 
     // --- WiFi Access Point ---
-    WiFi.softAP(AP_SSID, AP_PASS);
+    // Pin to MESH_WIFI_CHANNEL so the phone AP and ESP-NOW share one channel.
+    WiFi.softAP(AP_SSID, AP_PASS, MESH_WIFI_CHANNEL);
     IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[Setup] WiFi AP \"%s\" started.\n", AP_SSID);
+    Serial.printf("[Setup] WiFi AP \"%s\" on channel %d started.\n", AP_SSID, MESH_WIFI_CHANNEL);
     Serial.printf("[Setup] Open http://%s in your browser.\n", ip.toString().c_str());
+
+    // --- ESP-NOW (mesh receive) ---
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[Setup] ERROR: ESP-NOW init failed!");
+    } else {
+        Serial.println("[Setup] ESP-NOW initialised.");
+        esp_now_register_recv_cb(onMeshReceive);
+    }
 
     // --- WebSocket ---
     ws.onEvent(onWsEvent);

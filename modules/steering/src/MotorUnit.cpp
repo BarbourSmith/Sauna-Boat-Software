@@ -140,6 +140,6 @@ double MotorUnit::recomputePID() {
         _lastPIDLog = millis();
         Serial.printf("[PID] error=%.1f output=%.0f\n", error, output);
     }
-    _motor.runAtPWM(static_cast<long>(output));
+    _motor.runAtPWM(static_cast<long>(-output));
     return static_cast<double>(output);
 }

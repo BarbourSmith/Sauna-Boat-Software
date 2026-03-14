@@ -30,15 +30,21 @@
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
-// MSG_SET_ANGLE  – sent by the controller to the steering module.
+// MSG_SET_SPEED – sent by the controller to a speed-based steering module.
+//   value1 = normalized motor speed [-1.0, 1.0].
+//             Negative = port/left, positive = starboard/right.
+//   value2 = unused (0).
+#define MSG_SET_SPEED      0x01
+
+// MSG_SET_ANGLE  – sent by the controller to a PID angle-based steering module.
 //   value1 = desired heading in degrees [0, 360).
 //   value2 = unused (0).
-#define MSG_SET_ANGLE      0x01
+#define MSG_SET_ANGLE      0x02
 
-// MSG_ANGLE_STATUS – broadcast by the steering module at ~10 Hz.
+// MSG_ANGLE_STATUS – broadcast by an angle-based steering module at ~10 Hz.
 //   value1 = current measured angle (degrees).
 //   value2 = current target angle   (degrees).
-#define MSG_ANGLE_STATUS   0x02
+#define MSG_ANGLE_STATUS   0x03
 
 // ---------------------------------------------------------------------------
 // Message struct (max ESP-NOW payload is 250 bytes; this is 10 bytes)

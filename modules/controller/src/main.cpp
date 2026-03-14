@@ -1,11 +1,14 @@
 // main.cpp – Sauna Boat Controller Module
 // Plain ESP32 (not S3) — reads a PS3 DualShock 3 controller via Bluetooth
-// and sends steering angle commands to the steering module via ESP-NOW.
+// and sends steering speed commands to the steering module via ESP-NOW.
 //
-// Left analog stick X-axis = turn rate (proportional to deflection).
-// Full left  → HEADING_RATE_DEG_S left per second.
-// Full right → HEADING_RATE_DEG_S right per second.
-// Stick centred → hold current heading command.
+// Left analog stick X-axis → motor speed (-1.0 to 1.0).
+//   Full left  = full port speed.
+//   Stick centre (within dead-zone) = stop.
+//   Full right = full starboard speed.
+//
+// The steering module's existing speed ramp and max-speed settings still
+// apply, so the feel can be tuned from the phone UI without reflashing.
 //
 // Pairing (one-time):
 //   Flash this firmware, note the "Bluetooth MAC" on the serial monitor,
@@ -22,36 +25,34 @@
 // Tuning
 // ---------------------------------------------------------------------------
 
-// Maximum heading change rate when the stick is fully deflected (degrees/sec).
-static constexpr float HEADING_RATE_DEG_S = 90.0f;
-
-// Raw stick dead-zone (units, centred at 0, range ±128).
+// Raw stick dead-zone (units centred at 0, range ±128).
+// Increase if the motor creeps when the stick is released.
 static constexpr int STICK_DEADZONE = 10;
 
-// How often to send a heading update (ms). 20 Hz is plenty for a boat.
+// How often to send a speed update (ms).
+// Must be shorter than the steering module's watchdog (200 ms).
 static constexpr unsigned long SEND_INTERVAL_MS = 50;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-static float g_commandedAngle = 0.0f;  // current heading command, 0–360°
-static bool  g_ps3Connected   = false;
+static bool g_ps3Connected = false;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW helpers
 // ---------------------------------------------------------------------------
-static void sendAngle(float angle) {
+static void sendSpeed(float speed) {
     MeshMessage msg;
-    msg.type   = MSG_SET_ANGLE;
+    msg.type   = MSG_SET_SPEED;
     msg.src    = MODULE_CONTROLLER;
-    msg.value1 = angle;
+    msg.value1 = speed;
     msg.value2 = 0.0f;
     esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
 }
 
-static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t status) {
-    // Uncomment for debugging:
-    // Serial.printf("[Mesh] Send status: %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t /*status*/) {
+    // Uncomment to debug send failures:
+    // Serial.printf("[Mesh] %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
 // ---------------------------------------------------------------------------
@@ -63,8 +64,10 @@ static void onPs3Connect() {
 }
 
 static void onPs3Disconnect() {
-    Serial.println("[PS3] Controller disconnected.");
+    Serial.println("[PS3] Controller disconnected — sending stop.");
     g_ps3Connected = false;
+    // Immediately command zero speed so the motor doesn't coast.
+    sendSpeed(0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,11 +79,11 @@ void setup() {
     Serial.println("\n=== Sauna Boat Controller Module ===");
 
     // --- WiFi: STA mode required for ESP-NOW ---
-    // We do not associate with any AP; we only need the radio on the right channel.
+    // We don't associate with any AP; we only need the radio on the right channel.
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    // Both modules must operate on the same channel.
+    // Both modules must operate on the same channel as the steering AP.
     esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     Serial.printf("[Setup] WiFi STA MAC: %s  (channel %d)\n",
                   WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
@@ -93,7 +96,7 @@ void setup() {
     }
     esp_now_register_send_cb(onDataSent);
 
-    // Register the broadcast address as a peer so we can send to it.
+    // Register the broadcast address as a peer.
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
     peer.channel = MESH_WIFI_CHANNEL;
@@ -123,35 +126,35 @@ void loop() {
     static unsigned long lastLog  = 0;
     unsigned long now = millis();
 
-    if (g_ps3Connected && (now - lastSend >= SEND_INTERVAL_MS)) {
-        float dt = (now - lastSend) / 1000.0f;
+    if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
 
-        // Left stick X-axis: raw range is -128 to 127, centre = 0.
-        int8_t rawX = Ps3.data.analog.stick.lx;
+        float speed = 0.0f;
 
-        // Apply dead-zone.
-        if (rawX > -STICK_DEADZONE && rawX < STICK_DEADZONE) rawX = 0;
+        if (g_ps3Connected) {
+            // Left stick X-axis: raw range -128 to 127, centre = 0.
+            int8_t rawX = Ps3.data.analog.stick.lx;
 
-        // Map to a normalised rate (-1.0 to 1.0) and accumulate heading.
-        float rate = (rawX / 127.0f) * HEADING_RATE_DEG_S;
-        g_commandedAngle = fmodf(g_commandedAngle + rate * dt + 360.0f, 360.0f);
+            // Apply dead-zone.
+            if (rawX > -STICK_DEADZONE && rawX < STICK_DEADZONE) rawX = 0;
 
-        sendAngle(g_commandedAngle);
+            // Map directly to normalised speed [-1.0, 1.0].
+            speed = rawX / 127.0f;
+            speed = constrain(speed, -1.0f, 1.0f);
+        }
+        // When the controller is disconnected, speed stays 0.0f and we keep
+        // sending it so the steering watchdog doesn't time out and the motor
+        // stays stopped cleanly.
+        sendSpeed(speed);
     }
 
-    if (!g_ps3Connected) {
-        // Reset timer so dt is sensible on reconnect.
-        lastSend = millis();
-    }
-
-    // Periodic serial log (every 500 ms) for debugging.
+    // Periodic serial log for debugging.
     if (now - lastLog >= 500) {
         lastLog = now;
         if (g_ps3Connected) {
-            Serial.printf("[Loop] stickX=%d  commanded=%.1f°\n",
+            Serial.printf("[Loop] stickX=%d  speed=%.2f\n",
                           static_cast<int>(Ps3.data.analog.stick.lx),
-                          g_commandedAngle);
+                          Ps3.data.analog.stick.lx / 127.0f);
         } else {
             Serial.println("[Loop] Waiting for PS3 controller…");
         }
