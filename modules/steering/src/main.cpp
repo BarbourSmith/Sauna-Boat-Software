@@ -74,6 +74,18 @@ static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 // Accumulation buffer for POST /settings body
 static String g_settingsBody;
 
+// Motor direction reversal.
+// When true, all commanded speeds are negated before reaching the motor,
+// swapping which physical direction is "port" and which is "starboard".
+// Persisted in NVS under key "dirReverse".
+static bool g_dirReverse = false;
+
+// Apply the direction setting to a normalised speed [-1, 1] before driving
+// the motor. All call-sites must go through this function.
+static inline float applyDir(float speed) {
+    return g_dirReverse ? -speed : speed;
+}
+
 // ---------------------------------------------------------------------------
 // Mesh diagnostics
 // ---------------------------------------------------------------------------
@@ -109,7 +121,7 @@ static void onMeshReceive(const uint8_t* mac, const uint8_t* data, int len) {
 
     if (msg.type == MSG_SET_SPEED) {
         float speed = constrain(msg.value1, -1.0f, 1.0f);
-        steeringMotor.setSpeed(speed);
+        steeringMotor.setSpeed(applyDir(speed));
         g_currentSpeed  = speed;
         g_lastCmdTime   = millis();
         g_lastMeshSpeed = speed;
@@ -157,7 +169,7 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
             if (idx >= 0) {
                 float speed = msg.substring(idx + 8).toFloat();
                 speed = constrain(speed, -1.0f, 1.0f);
-                steeringMotor.setSpeed(speed);
+                steeringMotor.setSpeed(applyDir(speed));
                 g_currentSpeed = speed;
                 g_lastCmdTime  = millis();
                 g_cmdSource    = "WS";
@@ -211,9 +223,11 @@ void setup() {
     steeringMotor.setMaxSpeed(prefs.getInt("maxSpeed", 512));
     int snapTimeout = prefs.getInt("snapTimeout", 100);
     int rampMs      = prefs.getInt("rampMs", 500);
+    g_dirReverse    = prefs.getBool("dirReverse", false);
     steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-    Serial.printf("[Setup] Settings – maxSpeed=%d  snapTimeout=%d  rampMs=%d\n",
-                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
+    Serial.printf("[Setup] Settings – maxSpeed=%d  snapTimeout=%d  rampMs=%d  dirReverse=%s\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs,
+                  g_dirReverse ? "true" : "false");
 
     // --- WiFi AP pinned to MESH_WIFI_CHANNEL ---
     // ESP-NOW and the soft-AP must share a channel; we fix both to channel 1.
@@ -242,9 +256,10 @@ void setup() {
     });
 
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"maxSpeed\":"   + String(steeringMotor.getMaxSpeed())
+        String json = "{\"maxSpeed\":"    + String(steeringMotor.getMaxSpeed())
                     + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
                     + ",\"rampMs\":"      + String(prefs.getInt("rampMs", 500))
+                    + ",\"dirReverse\":"  + (g_dirReverse ? "true" : "false")
                     + "}";
         request->send(200, "application/json", json);
     });
@@ -256,6 +271,17 @@ void setup() {
                 int idx = json.indexOf(search);
                 if (idx < 0) return fallback;
                 return json.substring(idx + search.length()).toFloat();
+            };
+
+            auto parseBool = [](const String& json, const char* key, bool fallback) -> bool {
+                String search = "\""; search += key; search += "\":";
+                int idx = json.indexOf(search);
+                if (idx < 0) return fallback;
+                String rest = json.substring(idx + search.length());
+                rest.trim();
+                if (rest.startsWith("true"))  return true;
+                if (rest.startsWith("false")) return false;
+                return fallback;
             };
 
             int maxSpeed = constrain(static_cast<int>(
@@ -270,14 +296,18 @@ void setup() {
                 parseField(g_settingsBody, "rampMs",
                            static_cast<float>(prefs.getInt("rampMs", 500)))), 0, 2000);
 
+            bool dirReverse = parseBool(g_settingsBody, "dirReverse", g_dirReverse);
+
             steeringMotor.setMaxSpeed(maxSpeed);
             steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
+            g_dirReverse = dirReverse;
             prefs.putInt("maxSpeed",    maxSpeed);
             prefs.putInt("snapTimeout", snapTimeout);
             prefs.putInt("rampMs",      rampMs);
+            prefs.putBool("dirReverse", dirReverse);
 
-            Serial.printf("[Settings] Saved – maxSpeed=%d  snapTimeout=%d  rampMs=%d\n",
-                          maxSpeed, snapTimeout, rampMs);
+            Serial.printf("[Settings] Saved – maxSpeed=%d  snapTimeout=%d  rampMs=%d  dirReverse=%s\n",
+                          maxSpeed, snapTimeout, rampMs, dirReverse ? "true" : "false");
             request->send(200, "application/json", "{\"ok\":true}");
         },
         nullptr,

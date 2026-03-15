@@ -7,6 +7,10 @@
 //   Stick centre (within dead-zone) = stop.
 //   Full right = full starboard speed.
 //
+// D-pad left / right → jog: sends full speed in that direction for
+//   JOG_DURATION_MS milliseconds, then returns to stick control.
+//   Useful for making small, repeatable trim adjustments.
+//
 // The steering module's existing speed ramp and max-speed settings still
 // apply, so the feel can be tuned from the phone UI without reflashing.
 //
@@ -33,6 +37,11 @@ static constexpr int STICK_DEADZONE = 10;
 // Must be shorter than the steering module's watchdog (200 ms).
 static constexpr unsigned long SEND_INTERVAL_MS = 50;
 
+// How long a D-pad jog pulse lasts (ms).
+// The steering module's ramp setting applies, so the motor will ramp up
+// then back down — giving a smooth, repeatable trim nudge.
+static constexpr unsigned long JOG_DURATION_MS = 200;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -43,6 +52,12 @@ static uint32_t      g_sendCount     = 0;   // total packets sent
 static uint32_t      g_sendOkCount   = 0;   // successful sends
 static uint32_t      g_sendFailCount = 0;   // failed sends
 static float         g_lastSentSpeed = 0.0f;
+
+// D-pad jog state
+// g_jogUntil: millis() timestamp after which the jog is over (0 = no jog active).
+// g_jogSpeed: normalised speed to send during the jog (-1.0 or +1.0).
+static unsigned long g_jogUntil = 0;
+static float         g_jogSpeed = 0.0f;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW helpers
@@ -134,25 +149,60 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
-    static unsigned long lastSend = 0;
-    static unsigned long lastLog  = 0;
+    static unsigned long lastSend  = 0;
+    static unsigned long lastLog   = 0;
+    static bool          prevLeft  = false;  // D-pad rising-edge detection
+    static bool          prevRight = false;
     unsigned long now = millis();
 
+    // --- D-pad jog detection (checked every loop tick for low latency) ---
+    if (g_ps3Connected) {
+        bool curLeft  = Ps3.data.button.left;
+        bool curRight = Ps3.data.button.right;
+
+        if (curLeft && !prevLeft) {
+            // Left arrow just pressed — jog port (negative speed)
+            g_jogSpeed = -1.0f;
+            g_jogUntil = now + JOG_DURATION_MS;
+            Serial.printf("[Jog] LEFT  → speed=%.1f for %lums\n", g_jogSpeed, JOG_DURATION_MS);
+        }
+        if (curRight && !prevRight) {
+            // Right arrow just pressed — jog starboard (positive speed)
+            g_jogSpeed = 1.0f;
+            g_jogUntil = now + JOG_DURATION_MS;
+            Serial.printf("[Jog] RIGHT → speed=%.1f for %lums\n", g_jogSpeed, JOG_DURATION_MS);
+        }
+
+        prevLeft  = curLeft;
+        prevRight = curRight;
+    } else {
+        // Reset edge state when disconnected so re-connection doesn't
+        // trigger a spurious jog from a button held at connect time.
+        prevLeft  = false;
+        prevRight = false;
+    }
+
+    // --- Speed send (50 ms cadence) ---
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
 
         float speed = 0.0f;
 
         if (g_ps3Connected) {
-            // Left stick X-axis: raw range -128 to 127, centre = 0.
-            int8_t rawX = Ps3.data.analog.stick.lx;
+            if (now < g_jogUntil) {
+                // D-pad jog is active — override stick with full jog speed.
+                speed = g_jogSpeed;
+            } else {
+                // Normal stick control.
+                int8_t rawX = Ps3.data.analog.stick.lx;
 
-            // Apply dead-zone.
-            if (rawX > -STICK_DEADZONE && rawX < STICK_DEADZONE) rawX = 0;
+                // Apply dead-zone.
+                if (rawX > -STICK_DEADZONE && rawX < STICK_DEADZONE) rawX = 0;
 
-            // Map directly to normalised speed [-1.0, 1.0].
-            speed = rawX / 127.0f;
-            speed = constrain(speed, -1.0f, 1.0f);
+                // Map directly to normalised speed [-1.0, 1.0].
+                speed = rawX / 127.0f;
+                speed = constrain(speed, -1.0f, 1.0f);
+            }
         }
         // When the controller is disconnected, speed stays 0.0f and we keep
         // sending it so the steering watchdog doesn't time out and the motor

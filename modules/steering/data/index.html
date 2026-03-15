@@ -206,6 +206,23 @@
     }
     .btn-primary { background: var(--accent); color: #000; }
     .btn-secondary { background: rgba(255,255,255,0.08); color: var(--text); }
+
+    /* ── Checkbox field ── */
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .checkbox-label input[type="checkbox"] {
+      width: 17px;
+      height: 17px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
   </style>
 </head>
 <body>
@@ -259,6 +276,13 @@
              oninput="document.getElementById('rampms-range').value=this.value"
              style="margin-top:4px;" />
       <span class="hint">Time to ramp from stop to full speed. 0 = instant.</span>
+    </div>
+    <div class="field">
+      <label class="checkbox-label">
+        <input type="checkbox" id="dir-reverse" />
+        Reverse motor direction
+      </label>
+      <span class="hint">Swaps which way the motor spins for left and right commands.</span>
     </div>
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
@@ -475,6 +499,9 @@
           const r = data.rampMs !== undefined ? data.rampMs : 500;
           document.getElementById('rampms-range').value = r;
           document.getElementById('rampms-num').value   = r;
+
+          document.getElementById('dir-reverse').checked =
+            data.dirReverse !== undefined ? data.dirReverse : false;
         })
         .catch(function (e) { console.warn('Failed to load settings:', e); });
     }
@@ -483,10 +510,11 @@
       const maxSpeed    = parseInt(document.getElementById('maxspeed-num').value, 10);
       const snapTimeout = parseInt(document.getElementById('snaptimeout-num').value, 10);
       const rampMs      = parseInt(document.getElementById('rampms-num').value, 10);
+      const dirReverse  = document.getElementById('dir-reverse').checked;
       fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs })
+        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs, dirReverse: dirReverse })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {
