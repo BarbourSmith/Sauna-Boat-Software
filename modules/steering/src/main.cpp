@@ -26,6 +26,7 @@
 #include <AsyncTCP.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <Update.h>
 #include "MotorUnit.h"
 #include "SparkFun_I2C_Mux_Arduino_Library.h"
 #include "mesh_protocol.h"
@@ -73,6 +74,105 @@ static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 
 // Accumulation buffer for POST /settings body
 static String g_settingsBody;
+
+// Set to true by the OTA completion handler; loop() watches this and restarts
+// after the HTTP response has had time to be sent.
+static bool g_pendingRestart = false;
+
+// ---------------------------------------------------------------------------
+// OTA update page (served inline so it's always reachable even if LittleFS
+// content is stale or missing after a partial filesystem flash).
+// Styled to match the main steering UI.
+// ---------------------------------------------------------------------------
+static const char OTA_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Firmware Update</title>
+  <style>
+    :root { --bg:#0d1b2a; --panel:#1b2d42; --accent:#00b4d8; --text:#e0e0e0; --subtext:#8fa8c0; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text);
+           display:flex; flex-direction:column; align-items:center;
+           padding:40px 16px; gap:24px; }
+    h1   { font-size:1.1rem; color:var(--subtext); text-transform:uppercase;
+           letter-spacing:0.05em; }
+    .card { background:var(--panel); border-radius:16px; padding:28px 24px;
+            width:100%; max-width:400px; display:flex; flex-direction:column; gap:16px; }
+    p, .hint { font-size:0.82rem; color:var(--subtext); }
+    code { background:rgba(0,180,216,0.12); border-radius:4px; padding:2px 5px;
+           font-size:0.8rem; color:var(--accent); }
+    input[type=file] { background:var(--bg); color:var(--text);
+                       border:1px solid rgba(255,255,255,0.12); border-radius:6px;
+                       padding:8px 10px; font-size:0.9rem; width:100%; cursor:pointer; }
+    button { background:var(--accent); color:#000; border:none; border-radius:8px;
+             padding:10px 24px; font-size:0.95rem; font-weight:600; cursor:pointer; width:100%; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    progress { width:100%; accent-color:var(--accent); border-radius:4px; height:6px; }
+    #status { text-align:center; font-size:0.85rem; min-height:1.2em; }
+    #status.ok  { color:#4ade80; }
+    #status.err { color:#f87171; }
+    a { color:var(--accent); font-size:0.82rem; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+  </style>
+</head>
+<body>
+  <h1>Firmware Update</h1>
+  <div class="card">
+    <p>Upload the firmware binary produced by PlatformIO:</p>
+    <p><code>.pio/build/steering/firmware.bin</code></p>
+    <form id="form">
+      <input type="file" id="file" accept=".bin" required style="margin-bottom:12px;" />
+      <button type="submit" id="btn">Upload &amp; Flash</button>
+    </form>
+    <progress id="bar" value="0" max="100" style="display:none"></progress>
+    <div id="status"></div>
+    <a href="/">&#8592; Back to steering control</a>
+  </div>
+  <script>
+    var form = document.getElementById('form');
+    var btn  = document.getElementById('btn');
+    var bar  = document.getElementById('bar');
+    var st   = document.getElementById('status');
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var file = document.getElementById('file').files[0];
+      if (!file) return;
+      btn.disabled = true;
+      bar.style.display = 'block';
+      bar.value = 0;
+      st.className = '';
+      st.textContent = 'Uploading…';
+      var xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = function(ev) {
+        if (ev.lengthComputable) bar.value = (ev.loaded / ev.total) * 100;
+      };
+      xhr.onload = function() {
+        bar.value = 100;
+        if (xhr.status === 200) {
+          st.className = 'ok';
+          st.textContent = '✓ ' + xhr.responseText;
+        } else {
+          st.className = 'err';
+          st.textContent = '✗ ' + xhr.responseText;
+          btn.disabled = false;
+        }
+      };
+      xhr.onerror = function() {
+        st.className = 'err';
+        st.textContent = '✗ Connection lost — the board may have already rebooted.';
+      };
+      xhr.open('POST', '/update');
+      var fd = new FormData();
+      fd.append('firmware', file, file.name);
+      xhr.send(fd);
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
 
 // Motor direction reversal.
 // When true, all commanded speeds are negated before reaching the motor,
@@ -317,8 +417,53 @@ void setup() {
         }
     );
 
+    // --- OTA update routes ---
+    // GET  /update  → upload page (dark-themed, styled to match main UI)
+    // POST /update  → receives multipart firmware.bin, flashes it, reboots
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->send_P(200, "text/html", OTA_HTML);
+    });
+
+    server.on("/update", HTTP_POST,
+        // Called once when the upload is fully received.
+        [](AsyncWebServerRequest* request) {
+            bool ok = !Update.hasError();
+            AsyncWebServerResponse* resp = request->beginResponse(
+                ok ? 200 : 500,
+                "text/plain",
+                ok ? "Update complete — rebooting in 1 s" : Update.errorString());
+            resp->addHeader("Connection", "close");
+            request->send(resp);
+            if (ok) g_pendingRestart = true;
+        },
+        // Called for each chunk of the uploaded file.
+        [](AsyncWebServerRequest* /*request*/, const String& filename,
+           size_t index, uint8_t* data, size_t len, bool final) {
+            if (index == 0) {
+                Serial.printf("[OTA] Starting update: %s\n", filename.c_str());
+                // Stop the motor immediately so it doesn't run unattended
+                // while the CPU is busy flashing.
+                steeringMotor.stop();
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                    Update.printError(Serial);
+                }
+            }
+            if (len && Update.write(data, len) != len) {
+                Update.printError(Serial);
+            }
+            if (final) {
+                if (Update.end(true)) {
+                    Serial.printf("[OTA] Flash complete: %u bytes written\n", index + len);
+                } else {
+                    Update.printError(Serial);
+                }
+            }
+        }
+    );
+
     server.begin();
     Serial.println("[Setup] HTTP server started.");
+    Serial.println("[Setup] OTA update available at http://192.168.4.1/update");
     Serial.println("[Setup] Ready – waiting for commands from phone (WS) or controller (Mesh)");
 }
 
@@ -326,6 +471,12 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    // OTA restart deferred until after the HTTP response has been sent.
+    if (g_pendingRestart) {
+        delay(1000);
+        ESP.restart();
+    }
+
     unsigned long now = millis();
 
     // --- Safety watchdog ---
