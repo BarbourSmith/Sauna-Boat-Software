@@ -42,6 +42,10 @@ static constexpr unsigned long SEND_INTERVAL_MS = 50;
 // then back down — giving a smooth, repeatable trim nudge.
 static constexpr unsigned long JOG_DURATION_MS = 200;
 
+// How often to broadcast controller status (battery level, charging).
+// Battery changes slowly so 5 s is more than frequent enough.
+static constexpr unsigned long BATTERY_INTERVAL_MS = 5000;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -62,6 +66,37 @@ static float         g_jogSpeed = 0.0f;
 // ---------------------------------------------------------------------------
 // ESP-NOW helpers
 // ---------------------------------------------------------------------------
+
+// Map the PS3 battery enum to a simple 0-4 integer level.
+// Returns -1 if the value is unrecognised.
+static int ps3BatteryLevel() {
+    switch (Ps3.data.status.battery) {
+        case ps3_status_battery_shutdown: return 0;
+        case ps3_status_battery_dying:    return 1;
+        case ps3_status_battery_low:      return 2;
+        case ps3_status_battery_high:     return 3;
+        case ps3_status_battery_full:     return 4;
+        default:                          return -1;
+    }
+}
+
+// ps3_status_battery_charging (0xEE) means the controller is plugged in.
+static bool ps3IsCharging() {
+    return Ps3.data.status.battery == ps3_status_battery_charging;
+}
+
+static void sendBattery() {
+    int  level    = ps3BatteryLevel();
+    bool charging = ps3IsCharging();
+    MeshMessage msg;
+    msg.type   = MSG_CONTROLLER_STATUS;
+    msg.src    = MODULE_CONTROLLER;
+    msg.value1 = static_cast<float>(level);
+    msg.value2 = charging ? 1.0f : 0.0f;
+    esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    Serial.printf("[Battery] level=%d  charging=%s\n", level, charging ? "yes" : "no");
+}
+
 static void sendSpeed(float speed) {
     MeshMessage msg;
     msg.type   = MSG_SET_SPEED;
@@ -88,6 +123,9 @@ static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t status) {
 static void onPs3Connect() {
     Serial.println("[PS3] Controller connected.");
     g_ps3Connected = true;
+    // Send an immediate battery report so the UI updates straight away
+    // rather than waiting up to BATTERY_INTERVAL_MS.
+    sendBattery();
 }
 
 static void onPs3Disconnect() {
@@ -149,10 +187,11 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
-    static unsigned long lastSend  = 0;
-    static unsigned long lastLog   = 0;
-    static bool          prevLeft  = false;  // D-pad rising-edge detection
-    static bool          prevRight = false;
+    static unsigned long lastSend    = 0;
+    static unsigned long lastLog     = 0;
+    static unsigned long lastBattery = 0;
+    static bool          prevLeft    = false;  // D-pad rising-edge detection
+    static bool          prevRight   = false;
     unsigned long now = millis();
 
     // --- D-pad jog detection (checked every loop tick for low latency) ---
@@ -208,6 +247,12 @@ void loop() {
         // sending it so the steering watchdog doesn't time out and the motor
         // stays stopped cleanly.
         sendSpeed(speed);
+    }
+
+    // --- Battery status broadcast (every 5 s while PS3 is connected) ---
+    if (g_ps3Connected && (now - lastBattery >= BATTERY_INTERVAL_MS)) {
+        lastBattery = now;
+        sendBattery();
     }
 
     // Periodic serial log for debugging.

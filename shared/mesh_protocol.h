@@ -46,6 +46,12 @@
 //   value2 = current target angle   (degrees).
 #define MSG_ANGLE_STATUS   0x03
 
+// MSG_CONTROLLER_STATUS – broadcast by the controller module at ~0.2 Hz.
+//   value1 = PS3 battery level:  -1=unknown, 0=shutdown, 1=dying, 2=low,
+//                                 3=high, 4=full.
+//   value2 = charging flag:       1.0 = plugged in and charging, 0.0 = on battery.
+#define MSG_CONTROLLER_STATUS 0x04
+
 // ---------------------------------------------------------------------------
 // Message struct (max ESP-NOW payload is 250 bytes; this is 10 bytes)
 // ---------------------------------------------------------------------------

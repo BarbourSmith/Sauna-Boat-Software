@@ -50,6 +50,18 @@
     #status-dot.connected { background: var(--green); }
     #status-text { color: var(--subtext); }
 
+    /* ── Battery indicator ── */
+    #battery-indicator {
+      display: none;
+      align-items: center;
+      gap: 5px;
+      margin-left: 6px;
+      padding-left: 10px;
+      border-left: 1px solid rgba(255,255,255,0.12);
+      font-size: 0.8rem;
+    }
+    #battery-text { color: var(--subtext); }
+
     /* ── Main card ── */
     .card {
       background: var(--panel);
@@ -231,6 +243,10 @@
   <div id="status-bar">
     <div id="status-dot"></div>
     <span id="status-text">Connecting…</span>
+    <span id="battery-indicator">
+      <span id="battery-icon"></span>
+      <span id="battery-text"></span>
+    </span>
   </div>
 
   <!-- Joystick card -->
@@ -467,14 +483,44 @@
 
       ws.onerror = function () { ws.close(); };
 
-      // Server broadcasts are intentionally ignored for speed state.
-      // The client is the sole authority on what speed it is commanding.
-      // Echoing server speed back into currentSpeed caused a race condition:
-      // after snapBack() the firmware could broadcast the stale non-zero speed
-      // just before it processed the speed=0 message, resetting currentSpeed to
-      // non-zero while the puck was already visually centred — and then the
-      // heartbeat would re-send that stale speed to the motor.
-      ws.onmessage = function () {};
+      // Speed state is intentionally NOT echoed back from the server —
+      // the client is the sole authority on what speed it is commanding.
+      // We DO parse battery/charging status which only the server knows.
+      ws.onmessage = function (ev) {
+        try {
+          var d = JSON.parse(ev.data);
+          if (d.battery !== undefined) updateBattery(d.battery, !!d.charging);
+        } catch (e) {}
+      };
+    }
+
+    // ── Battery indicator ─────────────────────────────────────────────────
+    // level: -1=unknown, 0=shutdown, 1=dying, 2=low, 3=high, 4=full
+    // charging: true when plugged in
+    var BATTERY_LABELS = ['Shutdown', 'Critical', 'Low', 'High', 'Full'];
+    var BATTERY_COLORS = ['#f87171', '#f87171', '#fbbf24', '#4ade80', '#4ade80'];
+
+    function updateBattery(level, charging) {
+      var indicator = document.getElementById('battery-indicator');
+      var icon      = document.getElementById('battery-icon');
+      var text      = document.getElementById('battery-text');
+
+      if (level < 0) {
+        indicator.style.display = 'none';
+        return;
+      }
+
+      indicator.style.display = 'flex';
+
+      if (charging) {
+        icon.textContent        = '⚡';
+        text.textContent        = 'Charging';
+        text.style.color        = 'var(--accent)';
+      } else {
+        icon.textContent        = level <= 1 ? '🪫' : '🔋';
+        text.textContent        = BATTERY_LABELS[level] || '?';
+        text.style.color        = BATTERY_COLORS[level] || 'var(--subtext)';
+      }
     }
 
     // ── Settings ──────────────────────────────────────────────────────────

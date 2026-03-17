@@ -200,6 +200,15 @@ static constexpr unsigned long MESH_TIMEOUT_MS = 500;
 // Which source set the current speed ("WS"=phone, "Mesh"=controller, "---"=none yet)
 static const char* g_cmdSource = "---";
 
+// Last known PS3 controller battery status received over ESP-NOW.
+// g_ctrlBattery: -1=unknown, 0=shutdown, 1=dying, 2=low, 3=high, 4=full.
+// g_ctrlCharging: true when plugged in and charging.
+static int  g_ctrlBattery  = -1;
+static bool g_ctrlCharging = false;
+
+// Forward declaration — defined after broadcastStatus() below.
+static String buildStatusJson();
+
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback
 // Runs in the WiFi driver task. Keep it short.
@@ -229,6 +238,11 @@ static void onMeshReceive(const uint8_t* mac, const uint8_t* data, int len) {
 
         Serial.printf("[Mesh] MSG_SET_SPEED from module 0x%02X → %.2f\n",
                       msg.src, speed);
+    } else if (msg.type == MSG_CONTROLLER_STATUS) {
+        g_ctrlBattery  = static_cast<int>(msg.value1);
+        g_ctrlCharging = (msg.value2 >= 0.5f);
+        Serial.printf("[Mesh] MSG_CONTROLLER_STATUS from module 0x%02X → battery=%d  charging=%s\n",
+                      msg.src, g_ctrlBattery, g_ctrlCharging ? "yes" : "no");
     } else {
         Serial.printf("[Mesh] RX: unknown type 0x%02X from module 0x%02X, ignoring\n",
                       msg.type, msg.src);
@@ -243,9 +257,8 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
     if (type == WS_EVT_CONNECT) {
         Serial.printf("[WS] Client #%u connected from %s\n",
                       client->id(), client->remoteIP().toString().c_str());
-        // Echo current speed so the UI is in sync immediately.
-        String msg = "{\"speed\":" + String(g_currentSpeed, 2) + "}";
-        client->text(msg);
+        // Send current state so the UI is in sync immediately.
+        client->text(buildStatusJson());
 
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
@@ -279,12 +292,20 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast current speed to all WebSocket clients
+// Build the status JSON sent to WebSocket clients.
+// Includes speed and the latest controller battery info.
 // ---------------------------------------------------------------------------
+static String buildStatusJson() {
+    String json = "{\"speed\":"    + String(g_currentSpeed, 2)
+                + ",\"battery\":"  + String(g_ctrlBattery)
+                + ",\"charging\":" + (g_ctrlCharging ? "true" : "false")
+                + "}";
+    return json;
+}
+
 static void broadcastStatus() {
     if (ws.count() == 0) return;
-    String msg = "{\"speed\":" + String(g_currentSpeed, 2) + "}";
-    ws.textAll(msg);
+    ws.textAll(buildStatusJson());
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +442,7 @@ void setup() {
     // GET  /update  → upload page (dark-themed, styled to match main UI)
     // POST /update  → receives multipart firmware.bin, flashes it, reboots
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send_P(200, "text/html", OTA_HTML);
+        request->send(200, "text/html", OTA_HTML);
     });
 
     server.on("/update", HTTP_POST,
