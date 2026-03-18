@@ -267,13 +267,13 @@
   <div id="settings-panel">
     <h3>Settings</h3>
     <div class="field">
-      <label for="maxspeed-range">Max speed (PWM 0 – 1023)</label>
-      <input type="range" id="maxspeed-range" min="0" max="1023" step="1" value="512"
+      <label for="maxspeed-range">Servo travel limit (0 – 1023)</label>
+      <input type="range" id="maxspeed-range" min="0" max="1023" step="1" value="1023"
              oninput="document.getElementById('maxspeed-num').value=this.value" />
-      <input type="number" id="maxspeed-num" min="0" max="1023" step="1" value="512"
+      <input type="number" id="maxspeed-num" min="0" max="1023" step="1" value="1023"
              oninput="document.getElementById('maxspeed-range').value=this.value"
              style="margin-top:4px;" />
-      <span class="hint">PWM output when joystick is fully deflected.</span>
+      <span class="hint">1023 = full servo range (±500 µs). Reduce to limit physical travel.</span>
     </div>
     <div class="field">
       <label for="snaptimeout-range">Inactivity snap-back (50 – 5000 ms)</label>

@@ -1,17 +1,9 @@
 // main.cpp – Sauna Boat Steering System
-// ESP32-S3 firmware for the Maslow 4 control board
+// ESP32-S3 firmware driving an RC servo via GPIO 48.
 //
-// Hardware: Bottom-Right motor port on Maslow 4 board
-//   Motor forward pin : GPIO 9  (brIn1Pin)
-//   Motor backward pin: GPIO 3  (brIn2Pin)
-//   Current sense pin : GPIO 7  (brADCPin)
-//   Encoder I2C mux ch: 0       (BREncoderLine)
-//   LEDC PWM channel 1: 6       (brIn1Channel)
-//   LEDC PWM channel 2: 7       (brIn2Channel)
-//   I2C SDA           : GPIO 5
-//   I2C SCL           : GPIO 4
-//   I2C speed         : 200 kHz
-//   I2C Mux address   : 0x70
+// Hardware:
+//   Servo signal pin : GPIO 48
+//   LEDC channel     : 6
 //
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
@@ -27,7 +19,6 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include "MotorUnit.h"
-#include "SparkFun_I2C_Mux_Arduino_Library.h"
 #include "mesh_protocol.h"
 
 // ---------------------------------------------------------------------------
@@ -37,28 +28,17 @@ static const char* AP_SSID = "SaunaBoatSteering";
 static const char* AP_PASS = "12345678";
 
 // ---------------------------------------------------------------------------
-// Maslow 4 board pin definitions – Bottom-Right motor port
+// Steering servo pin definitions
 // ---------------------------------------------------------------------------
-#define I2C_SDA_PIN       5
-#define I2C_SCL_PIN       4
-#define I2C_FREQ_HZ       200000
-#define I2C_MUX_ADDR      0x70
-
-#define BR_FORWARD_PIN    3    // brIn2Pin (swapped: motor wires are inverse to encoder direction)
-#define BR_BACKWARD_PIN   9    // brIn1Pin (swapped: motor wires are inverse to encoder direction)
-#define BR_ADC_PIN        7    // brADCPin
-#define BR_ENCODER_CH     0    // BREncoderLine
-#define BR_PWM_CHANNEL1   6    // brIn1Channel
-#define BR_PWM_CHANNEL2   7    // brIn2Channel
+#define SERVO_PIN  48   // RC servo signal wire
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
-static QWIICMUX    i2cMux;
-static MotorUnit   steeringMotor;
+static MotorUnit      steeringMotor;
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
-static Preferences prefs;
+static Preferences    prefs;
 
 // Most recent normalized speed command received from the UI (-1.0 to 1.0).
 static float          g_currentSpeed = 0.0f;
@@ -107,7 +87,7 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
 
     } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("[WS] Client #%u disconnected\n", client->id());
-        // Stop the motor immediately when a client disconnects
+        // Center the servo immediately when a client disconnects
         steeringMotor.stop();
         g_currentSpeed = 0.0f;
 
@@ -133,7 +113,7 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast current motor speed to all connected WebSocket clients
+// Broadcast current servo position to all connected WebSocket clients
 // ---------------------------------------------------------------------------
 static void broadcastStatus() {
     if (ws.count() == 0) return;
@@ -149,21 +129,8 @@ void setup() {
     delay(500);
     Serial.println("\n=== Sauna Boat Steering System ===");
 
-    // --- I2C bus ---
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ);
-    Wire.setTimeOut(10);
-
-    // --- I2C Multiplexer (TCA9548A on Maslow 4 board) ---
-    if (!i2cMux.begin(I2C_MUX_ADDR, Wire)) {
-        Serial.println("[Setup] WARNING: I2C Mux not found – check wiring.");
-    } else {
-        Serial.println("[Setup] I2C Mux connected.");
-    }
-
-    // --- Steering motor (Bottom-Right port) ---
-    steeringMotor.begin(BR_FORWARD_PIN, BR_BACKWARD_PIN, BR_ADC_PIN,
-                        BR_ENCODER_CH, BR_PWM_CHANNEL1, BR_PWM_CHANNEL2,
-                        i2cMux);
+    // --- Steering servo ---
+    steeringMotor.begin(SERVO_PIN);
 
     // --- LittleFS (stores index.html) ---
     if (!LittleFS.begin(true)) {
@@ -174,13 +141,16 @@ void setup() {
 
     // --- NVS: load persisted settings ---
     prefs.begin("steering", false);
-    steeringMotor.setMaxSpeed(prefs.getInt("maxSpeed", 512));
+    // "maxTravel" replaces the old "maxSpeed" key (which stored the DC-motor PWM
+    // limit defaulting to 512).  Using a new key forces the correct default of
+    // 1023 (full servo range) on existing devices that have the old value stored.
+    steeringMotor.setMaxSpeed(prefs.getInt("maxTravel", 1023));
     // snapTimeout is a UI-only value; the firmware just stores and serves it.
     int snapTimeout = prefs.getInt("snapTimeout", 100);
-    // rampMs: time in ms to ramp from 0 to full speed (0 = instant).
+    // rampMs: time in ms to ramp from 0 to full deflection (0 = instant).
     int rampMs = prefs.getInt("rampMs", 500);
     steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-    Serial.printf("[Setup] Settings loaded – maxSpeed=%d snapTimeout=%d rampMs=%d\n",
+    Serial.printf("[Setup] Settings loaded – maxTravel=%d snapTimeout=%d rampMs=%d\n",
                   steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
 
     // --- WiFi Access Point ---
@@ -214,6 +184,8 @@ void setup() {
                     + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
                     + ",\"rampMs\":" + String(prefs.getInt("rampMs", 500))
                     + "}";
+        // Note: the JSON key is kept as "maxSpeed" for UI compatibility;
+        // the NVS key is "maxTravel" internally.
         request->send(200, "application/json", json);
     });
 
@@ -231,6 +203,7 @@ void setup() {
                 parseField(g_settingsBody, "maxSpeed",
                            static_cast<float>(steeringMotor.getMaxSpeed())));
             maxSpeed = constrain(maxSpeed, 0, 1023);
+            // Save under the new NVS key
 
             int snapTimeout = static_cast<int>(
                 parseField(g_settingsBody, "snapTimeout",
@@ -244,11 +217,11 @@ void setup() {
 
             steeringMotor.setMaxSpeed(maxSpeed);
             steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-            prefs.putInt("maxSpeed", maxSpeed);
+            prefs.putInt("maxTravel", maxSpeed);
             prefs.putInt("snapTimeout", snapTimeout);
             prefs.putInt("rampMs", rampMs);
 
-            Serial.printf("[Settings] Saved – maxSpeed=%d snapTimeout=%d rampMs=%d\n",
+            Serial.printf("[Settings] Saved – maxTravel=%d snapTimeout=%d rampMs=%d\n",
                           maxSpeed, snapTimeout, rampMs);
             request->send(200, "application/json", "{\"ok\":true}");
         },
@@ -269,9 +242,9 @@ void setup() {
 // ---------------------------------------------------------------------------
 void loop() {
     // Safety watchdog: if no speed command has been received for WATCHDOG_TIMEOUT_MS
-    // and the motor is running, stop it (handles network loss or browser close).
+    // and the servo is active, center it (handles network loss or browser close).
     if (g_currentSpeed != 0.0f && (millis() - g_lastCmdTime) > WATCHDOG_TIMEOUT_MS) {
-        Serial.println("[Loop] Watchdog: no recent command – stopping motor.");
+        Serial.println("[Loop] Watchdog: no recent command – centering servo.");
         steeringMotor.stop();
         g_currentSpeed = 0.0f;
     }
@@ -280,9 +253,7 @@ void loop() {
     static unsigned long lastDiag = 0;
     if (millis() - lastDiag >= 500) {
         lastDiag = millis();
-        Serial.printf("[Loop] speed=%.2f motorCurrent=%.0f\n",
-                      g_currentSpeed,
-                      steeringMotor.getMotorCurrent());
+        Serial.printf("[Loop] speed=%.2f\n", g_currentSpeed);
     }
 
     // Broadcast speed to WebSocket clients every 100 ms
@@ -299,7 +270,7 @@ void loop() {
         ws.cleanupClients();
     }
 
-    // Step the motor output toward the commanded speed at the configured ramp rate
+    // Step the servo position toward the commanded speed at the configured ramp rate
     steeringMotor.updateRamp();
 
     delay(10);  // ~100 Hz loop
