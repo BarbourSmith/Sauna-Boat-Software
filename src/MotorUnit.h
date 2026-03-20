@@ -37,6 +37,15 @@ public:
     void  setMaxSpeed(int maxPWM);
     int   getMaxSpeed() const;
 
+    // Reverse the servo direction (negate the commanded position).
+    void  setReversed(bool reversed);
+    bool  getReversed() const;
+
+    // Trim offset in µs added to the servo position after direction inversion.
+    // Range: -500 to +500 (±500 µs = ±full travel).  Typical use: ±50 µs.
+    void  setTrimUs(int trimUs);
+    int   getTrimUs() const;
+
     // Always returns 0.0 – RC servos have no current sense output.
     double getMotorCurrent();
 
@@ -49,4 +58,6 @@ private:
     unsigned long _lastRampTime = 0;
 
     int           _maxSpeed     = 1023;   // scales servo travel (0–1023); 1023 = full range
+    bool          _reversed     = false;  // negate position when true
+    float         _trim         = 0.0f;   // normalized offset added after inversion
 };

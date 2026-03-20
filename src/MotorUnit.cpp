@@ -11,7 +11,7 @@ void MotorUnit::begin(int servoPin) {
 void MotorUnit::stop() {
     _targetSpeed = 0.0f;
     _rampedSpeed = 0.0f;
-    _servo.center();
+    _servo.write(_trim);  // park at trim-adjusted center
 }
 
 void MotorUnit::setSpeed(float normalizedSpeed) {
@@ -38,6 +38,8 @@ void MotorUnit::updateRamp() {
 
     // Scale by maxSpeed (0–1023 → 0.0–1.0 fraction of full servo travel)
     float position = _rampedSpeed * (_maxSpeed / 1023.0f);
+    if (_reversed) position = -position;
+    position = constrain(position + _trim, -1.0f, 1.0f);
     _servo.write(position);
 }
 
@@ -50,6 +52,17 @@ void MotorUnit::setMaxSpeed(int maxPWM) {
 
 int MotorUnit::getMaxSpeed() const {
     return _maxSpeed;
+}
+
+void  MotorUnit::setReversed(bool reversed) { _reversed = reversed; }
+bool  MotorUnit::getReversed() const         { return _reversed; }
+
+void  MotorUnit::setTrimUs(int trimUs) {
+    trimUs  = constrain(trimUs, -500, 500);
+    _trim   = trimUs / 500.0f;   // normalize: ±500 µs → ±1.0
+}
+int   MotorUnit::getTrimUs() const {
+    return static_cast<int>(_trim * 500.0f);
 }
 
 double MotorUnit::getMotorCurrent() {

@@ -175,6 +175,23 @@
       font-size: 0.8rem;
       color: var(--subtext);
     }
+    /* ── Checkbox field ── */
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .checkbox-label input[type="checkbox"] {
+      width: 17px;
+      height: 17px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
     .field input[type="number"], .field input[type="range"] {
       background: var(--bg);
       color: var(--text);
@@ -252,13 +269,29 @@
       <span class="hint">Joystick recenters if touch stops moving for this long.</span>
     </div>
     <div class="field">
-      <label for="rampms-range">Speed ramp time (0 – 2000 ms)</label>
-      <input type="range" id="rampms-range" min="0" max="2000" step="50" value="500"
+      <label for="rampms-range">Servo slew rate (0 – 5000 ms)</label>
+      <input type="range" id="rampms-range" min="0" max="5000" step="50" value="500"
              oninput="document.getElementById('rampms-num').value=this.value" />
-      <input type="number" id="rampms-num" min="0" max="2000" step="50" value="500"
+      <input type="number" id="rampms-num" min="0" max="5000" step="50" value="500"
              oninput="document.getElementById('rampms-range').value=this.value"
              style="margin-top:4px;" />
-      <span class="hint">Time to ramp from stop to full speed. 0 = instant.</span>
+      <span class="hint">Time (ms) to sweep from stop to full deflection. 0 = instant.</span>
+    </div>
+    <div class="field">
+      <label class="checkbox-label">
+        <input type="checkbox" id="dir-reverse" />
+        Reverse servo direction
+      </label>
+      <span class="hint">Swaps left and right — use if steering responds backwards.</span>
+    </div>
+    <div class="field">
+      <label for="trim-range">Servo trim (−200 to +200 µs)</label>
+      <input type="range" id="trim-range" min="-200" max="200" step="1" value="0"
+             oninput="document.getElementById('trim-num').value=this.value" />
+      <input type="number" id="trim-num" min="-200" max="200" step="1" value="0"
+             oninput="document.getElementById('trim-range').value=this.value"
+             style="margin-top:4px;" />
+      <span class="hint">Offsets the servo center position. 0 = no trim.</span>
     </div>
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
@@ -475,6 +508,13 @@
           const r = data.rampMs !== undefined ? data.rampMs : 500;
           document.getElementById('rampms-range').value = r;
           document.getElementById('rampms-num').value   = r;
+
+          document.getElementById('dir-reverse').checked =
+            data.dirReverse !== undefined ? data.dirReverse : false;
+
+          const trim = data.trimUs !== undefined ? data.trimUs : 0;
+          document.getElementById('trim-range').value = trim;
+          document.getElementById('trim-num').value   = trim;
         })
         .catch(function (e) { console.warn('Failed to load settings:', e); });
     }
@@ -483,10 +523,13 @@
       const maxSpeed    = parseInt(document.getElementById('maxspeed-num').value, 10);
       const snapTimeout = parseInt(document.getElementById('snaptimeout-num').value, 10);
       const rampMs      = parseInt(document.getElementById('rampms-num').value, 10);
+      const dirReverse  = document.getElementById('dir-reverse').checked;
+      const trimUs      = parseInt(document.getElementById('trim-num').value, 10);
       fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs })
+        body: JSON.stringify({ maxSpeed: maxSpeed, snapTimeout: snapTimeout, rampMs: rampMs,
+                               dirReverse: dirReverse, trimUs: trimUs })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {

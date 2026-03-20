@@ -150,8 +150,13 @@ void setup() {
     // rampMs: time in ms to ramp from 0 to full deflection (0 = instant).
     int rampMs = prefs.getInt("rampMs", 500);
     steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-    Serial.printf("[Setup] Settings loaded – maxTravel=%d snapTimeout=%d rampMs=%d\n",
-                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
+    // dirReverse: invert servo direction.
+    steeringMotor.setReversed(prefs.getBool("dirReverse", false));
+    // trimUs: servo center trim offset in µs (-500 to +500).
+    steeringMotor.setTrimUs(prefs.getInt("trimUs", 0));
+    Serial.printf("[Setup] Settings loaded – maxTravel=%d snapTimeout=%d rampMs=%d dirReverse=%d trimUs=%d\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs,
+                  steeringMotor.getReversed(), steeringMotor.getTrimUs());
 
     // --- WiFi Access Point ---
     // Pin to MESH_WIFI_CHANNEL so the phone AP and ESP-NOW share one channel.
@@ -180,12 +185,12 @@ void setup() {
 
     // GET /settings – returns all tunable parameters as JSON
     server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"maxSpeed\":" + String(steeringMotor.getMaxSpeed())
+        String json = "{\"maxSpeed\":"    + String(steeringMotor.getMaxSpeed())
                     + ",\"snapTimeout\":" + String(prefs.getInt("snapTimeout", 100))
-                    + ",\"rampMs\":" + String(prefs.getInt("rampMs", 500))
+                    + ",\"rampMs\":"      + String(prefs.getInt("rampMs", 500))
+                    + ",\"dirReverse\":"  + String(steeringMotor.getReversed() ? "true" : "false")
+                    + ",\"trimUs\":"      + String(steeringMotor.getTrimUs())
                     + "}";
-        // Note: the JSON key is kept as "maxSpeed" for UI compatibility;
-        // the NVS key is "maxTravel" internally.
         request->send(200, "application/json", json);
     });
 
@@ -213,16 +218,37 @@ void setup() {
             int rampMs = static_cast<int>(
                 parseField(g_settingsBody, "rampMs",
                            static_cast<float>(prefs.getInt("rampMs", 500))));
-            rampMs = constrain(rampMs, 0, 2000);
+            rampMs = constrain(rampMs, 0, 5000);
+
+            // dirReverse: parse boolean ("true"/"false" or 1/0)
+            bool dirReverse = steeringMotor.getReversed();
+            {
+                String search = "\"dirReverse\":";
+                int idx = g_settingsBody.indexOf(search);
+                if (idx >= 0) {
+                    String rest = g_settingsBody.substring(idx + search.length());
+                    rest.trim();
+                    dirReverse = rest.startsWith("true") || rest.startsWith("1");
+                }
+            }
+
+            int trimUs = static_cast<int>(
+                parseField(g_settingsBody, "trimUs",
+                           static_cast<float>(steeringMotor.getTrimUs())));
+            trimUs = constrain(trimUs, -500, 500);
 
             steeringMotor.setMaxSpeed(maxSpeed);
             steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-            prefs.putInt("maxTravel", maxSpeed);
+            steeringMotor.setReversed(dirReverse);
+            steeringMotor.setTrimUs(trimUs);
+            prefs.putInt("maxTravel",  maxSpeed);
             prefs.putInt("snapTimeout", snapTimeout);
-            prefs.putInt("rampMs", rampMs);
+            prefs.putInt("rampMs",     rampMs);
+            prefs.putBool("dirReverse", dirReverse);
+            prefs.putInt("trimUs",     trimUs);
 
-            Serial.printf("[Settings] Saved – maxTravel=%d snapTimeout=%d rampMs=%d\n",
-                          maxSpeed, snapTimeout, rampMs);
+            Serial.printf("[Settings] Saved – maxTravel=%d snapTimeout=%d rampMs=%d dirReverse=%d trimUs=%d\n",
+                          maxSpeed, snapTimeout, rampMs, dirReverse, trimUs);
             request->send(200, "application/json", "{\"ok\":true}");
         },
         nullptr,  // upload handler (not needed)
