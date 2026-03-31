@@ -37,6 +37,12 @@ public:
     void  setMaxSpeed(int maxPWM);
     int   getMaxSpeed() const;
 
+    // Trim offset added to the final servo position after speed scaling.
+    // Units are normalised servo position [-1.0, 1.0], independent of maxSpeed.
+    // When the stick is centred the servo rests at this offset from mechanical centre.
+    void  setTrim(float trim);
+    float getTrim() const;
+
     // Always returns 0.0 – RC servos have no current sense output.
     double getMotorCurrent();
 
@@ -49,4 +55,5 @@ private:
     unsigned long _lastRampTime = 0;
 
     int           _maxSpeed     = 1023;   // scales servo travel (0–1023); 1023 = full range
+    float         _trim         = 0.0f;   // persistent servo centre offset [-1.0, 1.0]
 };

@@ -36,9 +36,10 @@ void MotorUnit::updateRamp() {
         }
     }
 
-    // Scale by maxSpeed (0–1023 → 0.0–1.0 fraction of full servo travel)
-    float position = _rampedSpeed * (_maxSpeed / 1023.0f);
-    _servo.write(position);
+    // Scale by maxSpeed (0–1023 → 0.0–1.0 fraction of full servo travel),
+    // then add the trim offset (in servo position units, independent of maxSpeed).
+    float position = _rampedSpeed * (_maxSpeed / 1023.0f) + _trim;
+    _servo.write(constrain(position, -1.0f, 1.0f));
 }
 
 void  MotorUnit::setRampRate(float unitsPerSec) { _rampRate = (unitsPerSec >= 0.0f) ? unitsPerSec : 0.0f; }
@@ -50,6 +51,14 @@ void MotorUnit::setMaxSpeed(int maxPWM) {
 
 int MotorUnit::getMaxSpeed() const {
     return _maxSpeed;
+}
+
+void MotorUnit::setTrim(float trim) {
+    _trim = constrain(trim, -1.0f, 1.0f);
+}
+
+float MotorUnit::getTrim() const {
+    return _trim;
 }
 
 double MotorUnit::getMotorCurrent() {

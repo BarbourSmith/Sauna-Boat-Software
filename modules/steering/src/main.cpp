@@ -8,7 +8,9 @@
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
 //
-// Mesh: accepts MSG_SET_SPEED commands from any module over ESP-NOW.
+// Mesh: accepts MSG_CONTROLLER_INPUT from the controller module over ESP-NOW.
+// Raw stick and button state is received here; this module applies dead-zone
+// and interprets D-pad left/right as trim jog commands.
 // The soft-AP is pinned to MESH_WIFI_CHANNEL so both share one radio channel.
 
 #include <Arduino.h>
@@ -43,33 +45,92 @@ static Preferences    prefs;
 // Most recent normalized speed command received from the UI (-1.0 to 1.0).
 static float          g_currentSpeed = 0.0f;
 
-// Timestamp of the last speed command received over WebSocket (ms).
+// Timestamp of the last speed command received over mesh or WebSocket (ms).
 // Used by the watchdog to stop the motor on connection loss.
 static unsigned long  g_lastCmdTime  = 0;
 
-// Motor stops if no speed command arrives within this window (milliseconds).
+// Trim state – D-pad left/right nudge the servo centre offset while held.
+// The value is applied inside MotorUnit::updateRamp() as a position offset.
+// g_trimDirty is set whenever trim changes; the loop saves it to NVS once
+// the buttons have been released for TRIM_SAVE_DEBOUNCE_MS to avoid flash wear.
+static uint16_t       g_prevButtons        = 0;
+static unsigned long  g_trimLastChange     = 0;
+static bool           g_trimDirty         = false;
+
+// Motor stops if no command arrives within this window (milliseconds).
 // Set to 200 ms so the motor stops if even one 100 ms heartbeat is missed.
 static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
+
+// Dead-zone applied to raw left-stick X from MSG_CONTROLLER_INPUT.
+// Sticks naturally drift; anything within this band is treated as centred.
+static constexpr float STICK_DEADZONE = 10.0f / 127.0f;  // ~8% of full range
+
+// Trim step applied each 50 ms frame while the D-pad button is held.
+// 0.01 ≈ 10 µs of servo pulse width; at 20 Hz this gives ~0.2 normalised/sec.
+static constexpr float TRIM_STEP = 0.01f;
+
+// How long (ms) to wait after the last trim change before saving to NVS.
+// Prevents flash wear when the button is held for many frames.
+static constexpr unsigned long TRIM_SAVE_DEBOUNCE_MS = 500;
 
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
-// Handles MSG_SET_SPEED from the controller module (or any future module).
-// Updating g_currentSpeed and g_lastCmdTime here is safe: both are 32-bit
-// aligned values and the ESP32 performs 32-bit loads/stores atomically.
+// All 32-bit-aligned globals written here are updated atomically on ESP32.
 // ---------------------------------------------------------------------------
 static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) {
-    if (len < static_cast<int>(sizeof(MeshMessage))) return;
-    MeshMessage msg;
-    memcpy(&msg, data, sizeof(msg));
+    if (len < 1) return;
+    uint8_t type = data[0];
 
-    if (msg.type == MSG_SET_SPEED) {
+    if (type == MSG_CONTROLLER_INPUT) {
+        if (len < static_cast<int>(sizeof(ControllerInputMessage))) return;
+        ControllerInputMessage msg;
+        memcpy(&msg, data, sizeof(msg));
+
+        g_lastCmdTime = millis();  // keep the watchdog alive
+
+        // D-pad left/right: adjust trim while the button is held (level-triggered).
+        // Each 50 ms frame the button is held nudges the servo centre by TRIM_STEP.
+        uint16_t btns = msg.buttons;
+        if (btns & CTRL_BTN_LEFT) {
+            float trim = constrain(steeringMotor.getTrim() - TRIM_STEP, -1.0f, 1.0f);
+            steeringMotor.setTrim(trim);
+            g_trimLastChange = millis();
+            g_trimDirty = true;
+        }
+        if (btns & CTRL_BTN_RIGHT) {
+            float trim = constrain(steeringMotor.getTrim() + TRIM_STEP, -1.0f, 1.0f);
+            steeringMotor.setTrim(trim);
+            g_trimLastChange = millis();
+            g_trimDirty = true;
+        }
+        if (g_trimDirty && (btns & (CTRL_BTN_LEFT | CTRL_BTN_RIGHT)) == 0
+                        && (g_prevButtons & (CTRL_BTN_LEFT | CTRL_BTN_RIGHT)) != 0) {
+            // Both buttons just released — log the settled trim value.
+            Serial.printf("[Trim] Adjusted to %.4f (will save to NVS shortly)\n",
+                          steeringMotor.getTrim());
+        }
+        g_prevButtons = btns;
+
+        // Apply dead-zone to left stick X and command the steering speed.
+        float lx = msg.lx;
+        if (lx > -STICK_DEADZONE && lx < STICK_DEADZONE) lx = 0.0f;
+        float speed = constrain(lx, -1.0f, 1.0f);
+
+        steeringMotor.setSpeed(speed);
+        g_currentSpeed = speed;
+
+    } else if (type == MSG_SET_SPEED) {
+        // Legacy fallback: accept pre-computed speed from older controller firmware.
+        if (len < static_cast<int>(sizeof(MeshMessage))) return;
+        MeshMessage msg;
+        memcpy(&msg, data, sizeof(msg));
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
-        g_lastCmdTime  = millis();  // keep the watchdog alive
+        g_lastCmdTime  = millis();
     }
 }
 
@@ -150,8 +211,10 @@ void setup() {
     // rampMs: time in ms to ramp from 0 to full deflection (0 = instant).
     int rampMs = prefs.getInt("rampMs", 500);
     steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
-    Serial.printf("[Setup] Settings loaded – maxTravel=%d snapTimeout=%d rampMs=%d\n",
-                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs);
+    // trim: persistent servo centre offset set via D-pad buttons on the controller.
+    steeringMotor.setTrim(prefs.getFloat("trim", 0.0f));
+    Serial.printf("[Setup] Settings loaded – maxTravel=%d snapTimeout=%d rampMs=%d trim=%.4f\n",
+                  steeringMotor.getMaxSpeed(), snapTimeout, rampMs, steeringMotor.getTrim());
 
     // --- WiFi Access Point ---
     // Pin to MESH_WIFI_CHANNEL so the phone AP and ESP-NOW share one channel.
@@ -241,6 +304,14 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    // Trim NVS save: write to flash once the D-pad has been released for
+    // TRIM_SAVE_DEBOUNCE_MS, avoiding repeated writes while the button is held.
+    if (g_trimDirty && (millis() - g_trimLastChange) >= TRIM_SAVE_DEBOUNCE_MS) {
+        prefs.putFloat("trim", steeringMotor.getTrim());
+        g_trimDirty = false;
+        Serial.printf("[Trim] Saved to NVS: %.4f\n", steeringMotor.getTrim());
+    }
+
     // Safety watchdog: if no speed command has been received for WATCHDOG_TIMEOUT_MS
     // and the servo is active, center it (handles network loss or browser close).
     if (g_currentSpeed != 0.0f && (millis() - g_lastCmdTime) > WATCHDOG_TIMEOUT_MS) {
