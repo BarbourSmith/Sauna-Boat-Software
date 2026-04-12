@@ -25,7 +25,8 @@
 // ---------------------------------------------------------------------------
 #define MODULE_STEERING    0x01
 #define MODULE_CONTROLLER  0x02
-// Add future modules here: #define MODULE_ENGINE 0x03, etc.
+#define MODULE_NAVIGATION  0x03
+// Add future modules here: #define MODULE_ENGINE 0x04, etc.
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -58,6 +59,11 @@
 //   Sent even when the PS3 controller is disconnected (all fields zero).
 //   See ControllerInputMessage struct and CTRL_BTN_* bitmask flags below.
 #define MSG_CONTROLLER_INPUT  0x05
+
+// MSG_NAV_STATUS – broadcast by the navigation module at ~2 Hz.
+//   Contains GPS position, speed, course, and magnetic heading.
+//   See NavigationMessage struct below.
+#define MSG_NAV_STATUS        0x06
 
 // ---------------------------------------------------------------------------
 // Button bitmask flags used in ControllerInputMessage.buttons
@@ -101,6 +107,19 @@ struct ControllerInputMessage {
     float    ry;       // right stick Y, [-1.0, 1.0]
     uint16_t buttons;  // CTRL_BTN_* bitmask; 0 when controller is disconnected
 };  // 20 bytes
+
+// Navigation module broadcast – GPS + compass data.
+struct NavigationMessage {
+    uint8_t  type;      // MSG_NAV_STATUS
+    uint8_t  src;       // MODULE_NAVIGATION
+    uint8_t  fixType;   // 0 = no fix, 1 = GPS fix, 2 = DGPS
+    uint8_t  satellites; // number of satellites in use
+    float    lat;       // latitude  in degrees (negative = south)
+    float    lon;       // longitude in degrees (negative = west)
+    float    speedKnots; // speed over ground in knots
+    float    course;    // GPS course over ground in degrees [0, 360)
+    float    heading;   // magnetic compass heading in degrees [0, 360)
+};  // 24 bytes
 #pragma pack(pop)
 
 // Broadcast MAC address – send here to reach every ESP-NOW peer at once.

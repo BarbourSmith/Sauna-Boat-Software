@@ -38,7 +38,8 @@ void MotorUnit::updateRamp() {
 
     // Scale by maxSpeed (0–1023 → 0.0–1.0 fraction of full servo travel),
     // then add the trim offset (in servo position units, independent of maxSpeed).
-    float position = _rampedSpeed * (_maxSpeed / 1023.0f) + _trim;
+    // Negate the final position to reverse the servo's default mechanical direction.
+    float position = -(_rampedSpeed * (_maxSpeed / 1023.0f) + _trim);
     _servo.write(constrain(position, -1.0f, 1.0f));
 }
 
