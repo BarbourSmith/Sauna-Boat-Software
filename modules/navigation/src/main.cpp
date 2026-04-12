@@ -46,6 +46,13 @@ static Preferences        prefs;
 static float g_heading = 0.0f;   // magnetic heading in degrees [0, 360)
 static bool  g_bmm150Ok = false; // magnetometer initialised successfully
 
+// Exponential moving average (EMA) filter for heading.
+// We filter in the sin/cos domain to avoid discontinuities at 0°/360°.
+// Alpha = 0.0–1.0; lower = smoother but slower to respond.
+static constexpr float HEADING_EMA_ALPHA = 0.15f;
+static float g_emaSin = 0.0f;  // filtered sin(heading)
+static float g_emaCos = 1.0f;  // filtered cos(heading) — initialised to 0° (north)
+
 // Hard-iron calibration offsets (subtracted from raw readings before heading calc)
 static float g_calOffsetX = 0.0f;
 static float g_calOffsetY = 0.0f;
@@ -149,7 +156,7 @@ static void calFinish() {
 // ---------------------------------------------------------------------------
 
 // Read the BMM150 and compute a tilt-uncompensated 2-D heading.
-// Applies hard-iron offset correction when calibrated.
+// Applies hard-iron offset correction and EMA smoothing.
 // Returns degrees [0, 360).
 static float readHeading() {
     sBmm150MagData_t mag = bmm150.getGeomagneticData();
@@ -163,7 +170,15 @@ static float readHeading() {
     float cx = mag.x - g_calOffsetX;
     float cy = mag.y - g_calOffsetY;
 
-    float h = atan2(cx, cy) * 180.0f / PI;
+    float rawDeg = atan2(cx, cy) * 180.0f / PI;
+    if (rawDeg < 0) rawDeg += 360.0f;
+
+    // EMA in the sin/cos domain so the filter wraps correctly around 0°/360°.
+    float rawRad = rawDeg * PI / 180.0f;
+    g_emaSin = HEADING_EMA_ALPHA * sinf(rawRad) + (1.0f - HEADING_EMA_ALPHA) * g_emaSin;
+    g_emaCos = HEADING_EMA_ALPHA * cosf(rawRad) + (1.0f - HEADING_EMA_ALPHA) * g_emaCos;
+
+    float h = atan2f(g_emaSin, g_emaCos) * 180.0f / PI;
     if (h < 0) h += 360.0f;
     return h;
 }
@@ -335,11 +350,22 @@ void loop() {
                           (unsigned long)g_sendCount,
                           (unsigned long)g_sendOkCount,
                           (unsigned long)g_sendFailCount);
-        } else {
-            Serial.printf("[Nav] GPS: NO FIX  sats=%lu  chars=%lu | "
+        } else if (gps.charsProcessed() < 10) {
+            // No meaningful data received — likely a wiring or baud rate issue.
+            Serial.printf("[Nav] GPS: NO DATA (check wiring: TX→GPIO%d, baud=%d) | "
                           "hdg=%.1f° [%s] | mesh: sent=%lu ok=%lu fail=%lu\n",
+                          GPS_RX_PIN, GPS_BAUD,
+                          g_heading, calTag,
+                          (unsigned long)g_sendCount,
+                          (unsigned long)g_sendOkCount,
+                          (unsigned long)g_sendFailCount);
+        } else {
+            // Receiving NMEA sentences but no position fix yet.
+            Serial.printf("[Nav] GPS: WAITING FOR FIX  sats=%lu  sentences=%lu  "
+                          "failed=%lu | hdg=%.1f° [%s] | mesh: sent=%lu ok=%lu fail=%lu\n",
                           (unsigned long)gps.satellites.value(),
-                          (unsigned long)gps.charsProcessed(),
+                          gps.sentencesWithFix(),
+                          gps.failedChecksum(),
                           g_heading, calTag,
                           (unsigned long)g_sendCount,
                           (unsigned long)g_sendOkCount,
