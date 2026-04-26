@@ -69,6 +69,20 @@ static void sendBattery() {
     Serial.printf("[Battery] level=%d  charging=%s\n", level, charging ? "yes" : "no");
 }
 
+// Send a raw steering command so the system works even without the navigation
+// module.  No dead zone is applied — the receiving module decides.
+// When the navigation module IS present and heading hold is active, it will
+// also send MSG_SET_STEERING — the steering module prioritises the nav module's
+// commands (see steering onMeshReceive).
+static void sendSteering(float stickX) {
+    MeshMessage msg;
+    msg.type   = MSG_SET_STEERING;
+    msg.src    = MODULE_CONTROLLER;
+    msg.value1 = constrain(stickX, -1.0f, 1.0f);
+    msg.value2 = 0.0f;
+    esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+}
+
 // Broadcast the raw PS3 controller state.  When the controller is disconnected
 // all fields are zero, which keeps the steering watchdog alive and stops motion.
 static void sendControllerInput() {
@@ -185,10 +199,16 @@ void loop() {
     static unsigned long lastBattery = 0;
     unsigned long now = millis();
 
-    // Broadcast raw controller input at SEND_INTERVAL_MS cadence.
+    // Broadcast raw controller input + direct steering speed at SEND_INTERVAL_MS.
+    // MSG_CONTROLLER_INPUT goes to the nav module (if present) for heading hold.
+    // MSG_SET_STEERING goes directly to the steering module as a fallback.
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
         sendControllerInput();
+        float lx = g_ps3Connected
+            ? constrain(Ps3.data.analog.stick.lx / 127.0f, -1.0f, 1.0f)
+            : 0.0f;
+        sendSteering(lx);
     }
 
     // Battery status broadcast (every 5 s while PS3 is connected).

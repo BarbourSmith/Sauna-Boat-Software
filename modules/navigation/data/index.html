@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sauna Boat – Navigation</title>
+  <style>
+    :root {
+      --bg:      #0d1b2a;
+      --panel:   #1b2d42;
+      --accent:  #00b4d8;
+      --text:    #e0e0e0;
+      --subtext: #8fa8c0;
+      --green:   #4ade80;
+      --red:     #f87171;
+      --yellow:  #facc15;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+      gap: 20px;
+    }
+
+    /* Status pill */
+    #status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border-radius: 999px;
+      padding: 6px 16px;
+      font-size: 0.82rem;
+    }
+    #status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+    #status-dot.connected { background: var(--green); }
+    #status-text { color: var(--subtext); }
+
+    /* Cards */
+    .card {
+      background: var(--panel);
+      border-radius: 16px;
+      padding: 24px;
+      width: 100%;
+      max-width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--subtext);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    /* Compass display */
+    .compass-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    #compass-ring {
+      position: relative;
+      width: 180px; height: 180px;
+      border-radius: 50%;
+      border: 3px solid rgba(0,180,216,0.3);
+      background: rgba(0,180,216,0.05);
+    }
+    #compass-needle {
+      position: absolute;
+      left: 50%; top: 50%;
+      width: 4px; height: 70px;
+      margin-left: -2px;
+      margin-top: -70px;
+      background: linear-gradient(to top, var(--accent), #fff);
+      border-radius: 2px;
+      transform-origin: bottom center;
+      transition: transform 0.15s ease-out;
+    }
+    #compass-target {
+      position: absolute;
+      left: 50%; top: 50%;
+      width: 3px; height: 65px;
+      margin-left: -1.5px;
+      margin-top: -65px;
+      background: var(--yellow);
+      opacity: 0.5;
+      border-radius: 2px;
+      transform-origin: bottom center;
+      transition: transform 0.15s ease-out;
+      display: none;
+    }
+    .compass-labels {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      font-size: 0.7rem;
+      color: var(--subtext);
+      font-weight: 600;
+    }
+    .compass-labels span {
+      position: absolute;
+    }
+    .compass-labels .n { top: 6px;   left: 50%; transform: translateX(-50%); color: var(--red); }
+    .compass-labels .s { bottom: 6px; left: 50%; transform: translateX(-50%); }
+    .compass-labels .e { right: 6px; top: 50%;  transform: translateY(-50%); }
+    .compass-labels .w { left: 6px;  top: 50%;  transform: translateY(-50%); }
+
+    .heading-value {
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: var(--accent);
+      text-align: center;
+    }
+    .heading-sub {
+      font-size: 0.8rem;
+      color: var(--subtext);
+      text-align: center;
+    }
+
+    /* Status rows */
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .stat {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .stat-label {
+      font-size: 0.7rem;
+      color: var(--subtext);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .stat-value {
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+    .stat-value.on  { color: var(--green); }
+    .stat-value.off { color: var(--subtext); }
+    .stat-value.warn { color: var(--yellow); }
+
+    /* Buttons */
+    .btn {
+      border: none;
+      border-radius: 8px;
+      padding: 10px 20px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      font-weight: 600;
+      width: 100%;
+    }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-secondary { background: rgba(255,255,255,0.08); color: var(--text); }
+    .btn-warn { background: var(--yellow); color: #000; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-row {
+      display: flex;
+      gap: 10px;
+    }
+    .btn-row .btn { flex: 1; }
+
+    /* Tuning fields */
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .field label {
+      font-size: 0.78rem;
+      color: var(--subtext);
+    }
+    .field-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .field-row input[type="range"] {
+      flex: 1;
+      cursor: pointer;
+    }
+    .field-row input[type="number"] {
+      width: 80px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 0.9rem;
+      text-align: right;
+    }
+    .field .hint {
+      font-size: 0.7rem;
+      color: var(--subtext);
+    }
+
+    /* Collapsible sections */
+    .section-toggle {
+      background: none;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 8px 16px;
+      color: var(--subtext);
+      font-size: 0.85rem;
+      cursor: pointer;
+      width: 100%;
+      max-width: 400px;
+      text-align: left;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .section-toggle:hover { color: var(--text); border-color: var(--accent); }
+    .section-content { display: none; }
+    .section-content.open { display: flex; }
+  </style>
+</head>
+<body>
+
+  <!-- Connection status -->
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+
+  <!-- Compass card -->
+  <div class="card">
+    <h2>Compass</h2>
+    <div class="compass-wrap">
+      <div id="compass-ring">
+        <div id="compass-needle"></div>
+        <div id="compass-target"></div>
+        <div class="compass-labels">
+          <span class="n">N</span>
+          <span class="s">S</span>
+          <span class="e">E</span>
+          <span class="w">W</span>
+        </div>
+      </div>
+      <div class="heading-value" id="hdg-value">---</div>
+      <div class="heading-sub" id="hdg-sub">&nbsp;</div>
+    </div>
+
+    <div class="status-grid">
+      <div class="stat">
+        <span class="stat-label">Autopilot</span>
+        <span class="stat-value off" id="ap-status">Manual</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Steering</span>
+        <span class="stat-value" id="steer-value">0.000</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Error</span>
+        <span class="stat-value" id="err-value">--</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Calibration</span>
+        <span class="stat-value warn" id="cal-status">--</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- GPS card -->
+  <div class="card">
+    <h2>GPS</h2>
+    <div class="status-grid">
+      <div class="stat">
+        <span class="stat-label">Fix</span>
+        <span class="stat-value off" id="gps-fix">No Fix</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Satellites</span>
+        <span class="stat-value" id="gps-sats">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Position</span>
+        <span class="stat-value" id="gps-pos" style="font-size:0.85rem">--</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Speed / Course</span>
+        <span class="stat-value" id="gps-spd">--</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controller card -->
+  <div class="card">
+    <h2>Controller</h2>
+    <div class="status-grid">
+      <div class="stat">
+        <span class="stat-label">Status</span>
+        <span class="stat-value off" id="ctrl-status">Offline</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Stick X</span>
+        <span class="stat-value" id="ctrl-stick">0.00</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Calibrate button -->
+  <button class="section-toggle" id="cal-btn" onclick="startCal()">Start Compass Calibration</button>
+
+  <!-- Tuning section -->
+  <button class="section-toggle" onclick="toggleTuning()">Autopilot Tuning</button>
+  <div class="card section-content" id="tuning-panel">
+    <h2>PD Tuning</h2>
+    <div class="field">
+      <label>Proportional Gain (Kp)</label>
+      <div class="field-row">
+        <input type="range" id="kp-range" min="0" max="0.1" step="0.001"
+               oninput="document.getElementById('kp-num').value=this.value" />
+        <input type="number" id="kp-num" min="0" max="1" step="0.001"
+               oninput="document.getElementById('kp-range').value=this.value" />
+      </div>
+      <span class="hint">How hard it steers per degree of error. Higher = more aggressive turns.</span>
+    </div>
+    <div class="field">
+      <label>Integral Gain (Ki)</label>
+      <div class="field-row">
+        <input type="range" id="ki-range" min="0" max="0.1" step="0.001"
+               oninput="document.getElementById('ki-num').value=this.value" />
+        <input type="number" id="ki-num" min="0" max="1" step="0.001"
+               oninput="document.getElementById('ki-range').value=this.value" />
+      </div>
+      <span class="hint">Corrects persistent drift over time. Higher = stronger steady-state correction.</span>
+    </div>
+    <div class="field">
+      <label>Derivative Gain (Kd)</label>
+      <div class="field-row">
+        <input type="range" id="kd-range" min="0" max="1" step="0.01"
+               oninput="document.getElementById('kd-num').value=this.value" />
+        <input type="number" id="kd-num" min="0" max="5" step="0.01"
+               oninput="document.getElementById('kd-range').value=this.value" />
+      </div>
+      <span class="hint">Braking force as heading approaches target. Higher = less overshoot.</span>
+    </div>
+    <div class="field">
+      <label>Max Steering Output</label>
+      <div class="field-row">
+        <input type="range" id="max-range" min="0.05" max="1" step="0.05"
+               oninput="document.getElementById('max-num').value=this.value" />
+        <input type="number" id="max-num" min="0.05" max="1" step="0.05"
+               oninput="document.getElementById('max-range').value=this.value" />
+      </div>
+      <span class="hint">Caps how far the rudder can go (0.05 – 1.0).</span>
+    </div>
+    <div class="field">
+      <label>Dead Band (degrees)</label>
+      <div class="field-row">
+        <input type="range" id="dead-range" min="0" max="30" step="0.5"
+               oninput="document.getElementById('dead-num').value=this.value" />
+        <input type="number" id="dead-num" min="0" max="30" step="0.5"
+               oninput="document.getElementById('dead-range').value=this.value" />
+      </div>
+      <span class="hint">Ignore heading errors smaller than this.</span>
+    </div>
+    <div class="field">
+      <label>Rate Limit (per tick)</label>
+      <div class="field-row">
+        <input type="range" id="rate-range" min="0.001" max="0.5" step="0.001"
+               oninput="document.getElementById('rate-num').value=this.value" />
+        <input type="number" id="rate-num" min="0.001" max="1" step="0.001"
+               oninput="document.getElementById('rate-range').value=this.value" />
+      </div>
+      <span class="hint">Max change in steering per autopilot tick. Lower = smoother.</span>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="toggleTuning()">Cancel</button>
+      <button class="btn btn-primary"   onclick="saveTuning()">Save</button>
+    </div>
+  </div>
+
+  <script>
+    var ws = null;
+    var reconnectTimer = null;
+
+    function connect() {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (ws) {
+        ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      }
+
+      ws = new WebSocket('ws://' + location.hostname + '/ws');
+
+      ws.onopen = function () {
+        document.getElementById('status-dot').classList.add('connected');
+        document.getElementById('status-text').textContent = 'Connected';
+      };
+
+      ws.onclose = function () {
+        document.getElementById('status-dot').classList.remove('connected');
+        document.getElementById('status-text').textContent = 'Disconnected';
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = function () { ws.close(); };
+
+      ws.onmessage = function (evt) {
+        try { var d = JSON.parse(evt.data); updateUI(d); } catch (e) {}
+      };
+    }
+
+    function updateUI(d) {
+      // Compass needle
+      var needle = document.getElementById('compass-needle');
+      needle.style.transform = 'rotate(' + d.hdg + 'deg)';
+
+      // Target needle
+      var target = document.getElementById('compass-target');
+      if (d.hold) {
+        target.style.display = 'block';
+        target.style.transform = 'rotate(' + d.target + 'deg)';
+      } else {
+        target.style.display = 'none';
+      }
+
+      // Heading value
+      document.getElementById('hdg-value').textContent = d.hdg.toFixed(1) + '\u00B0';
+
+      // Autopilot sub-text
+      var sub = document.getElementById('hdg-sub');
+      if (d.hold) {
+        sub.textContent = 'Holding ' + d.target.toFixed(1) + '\u00B0  |  Error: ' + d.err.toFixed(1) + '\u00B0';
+      } else {
+        sub.textContent = 'Manual';
+      }
+
+      // Status grid
+      var apEl = document.getElementById('ap-status');
+      if (d.hold) {
+        apEl.textContent = 'HOLD';
+        apEl.className = 'stat-value on';
+      } else {
+        apEl.textContent = 'Manual';
+        apEl.className = 'stat-value off';
+      }
+
+      document.getElementById('steer-value').textContent = d.steer.toFixed(3);
+      document.getElementById('err-value').textContent = d.hold ? (d.err.toFixed(1) + '\u00B0') : '--';
+
+      var calEl = document.getElementById('cal-status');
+      var calBtn = document.getElementById('cal-btn');
+      if (d.calActive) {
+        calEl.textContent = 'Running (' + (d.calRemain || 0) + 's)';
+        calEl.className = 'stat-value warn';
+        calBtn.disabled = true;
+        calBtn.textContent = 'Calibrating… (' + (d.calRemain || 0) + 's)';
+      } else if (d.cal) {
+        calEl.textContent = 'OK';
+        calEl.className = 'stat-value on';
+        calBtn.disabled = false;
+        calBtn.textContent = 'Start Compass Calibration';
+      } else {
+        calEl.textContent = 'Needed';
+        calEl.className = 'stat-value warn';
+        calBtn.disabled = false;
+        calBtn.textContent = 'Start Compass Calibration';
+      }
+
+      // GPS
+      var fixEl = document.getElementById('gps-fix');
+      if (d.gpsFix) {
+        fixEl.textContent = 'Fix';
+        fixEl.className = 'stat-value on';
+      } else if (d.gpsChars < 10) {
+        fixEl.textContent = 'No Data';
+        fixEl.className = 'stat-value off';
+      } else {
+        fixEl.textContent = 'Searching';
+        fixEl.className = 'stat-value warn';
+      }
+      document.getElementById('gps-sats').textContent = d.gpsSats;
+      document.getElementById('gps-pos').textContent = d.gpsFix
+        ? (d.lat.toFixed(5) + ', ' + d.lon.toFixed(5))
+        : '--';
+      document.getElementById('gps-spd').textContent = d.gpsFix
+        ? (d.spd.toFixed(1) + ' kn / ' + d.crs.toFixed(0) + '\u00B0')
+        : '--';
+
+      // Controller
+      var ctrlEl = document.getElementById('ctrl-status');
+      if (d.ctrl) {
+        ctrlEl.textContent = 'Online';
+        ctrlEl.className = 'stat-value on';
+      } else {
+        ctrlEl.textContent = 'Offline';
+        ctrlEl.className = 'stat-value off';
+      }
+      document.getElementById('ctrl-stick').textContent = d.stick.toFixed(2);
+    }
+
+    // Calibration
+    function startCal() {
+      fetch('/calibrate', { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .catch(function () {});
+    }
+
+    // Tuning panel
+    function toggleTuning() {
+      var panel = document.getElementById('tuning-panel');
+      var isOpen = panel.classList.contains('open');
+      if (!isOpen) loadTuning();
+      panel.classList.toggle('open');
+    }
+
+    function loadTuning() {
+      fetch('/settings')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          setField('kp', d.kp);
+          setField('ki', d.ki);
+          setField('kd', d.kd);
+          setField('max', d.maxOutput);
+          setField('dead', d.deadband);
+          setField('rate', d.rateLimit);
+        })
+        .catch(function () {});
+    }
+
+    function setField(name, val) {
+      document.getElementById(name + '-range').value = val;
+      document.getElementById(name + '-num').value   = val;
+    }
+
+    function saveTuning() {
+      var body = {
+        kp:        parseFloat(document.getElementById('kp-num').value),
+        ki:        parseFloat(document.getElementById('ki-num').value),
+        kd:        parseFloat(document.getElementById('kd-num').value),
+        maxOutput: parseFloat(document.getElementById('max-num').value),
+        deadband:  parseFloat(document.getElementById('dead-num').value),
+        rateLimit: parseFloat(document.getElementById('rate-num').value)
+      };
+      fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.ok) document.getElementById('tuning-panel').classList.remove('open');
+        })
+        .catch(function () {});
+    }
+
+    // Reconnect on screen wake
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && (!ws || ws.readyState !== WebSocket.OPEN)) connect();
+    });
+    window.addEventListener('online', function () {
+      if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+    });
+
+    connect();
+  </script>
+</body>
+</html>

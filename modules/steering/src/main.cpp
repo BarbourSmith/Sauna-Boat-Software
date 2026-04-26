@@ -122,7 +122,7 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
 
-    } else if (type == MSG_SET_SPEED) {
+    } else if (type == MSG_SET_STEERING) {
         // Legacy fallback: accept pre-computed speed from older controller firmware.
         if (len < static_cast<int>(sizeof(MeshMessage))) return;
         MeshMessage msg;

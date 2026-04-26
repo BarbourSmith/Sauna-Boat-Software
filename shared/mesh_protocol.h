@@ -31,11 +31,12 @@
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
-// MSG_SET_SPEED – sent by the controller to a speed-based steering module.
-//   value1 = normalized motor speed [-1.0, 1.0].
+// MSG_SET_STEERING – sent by the controller (or navigation module) to the
+//   steering module.
+//   value1 = normalized rudder position [-1.0, 1.0].
 //             Negative = port/left, positive = starboard/right.
 //   value2 = unused (0).
-#define MSG_SET_SPEED      0x01
+#define MSG_SET_STEERING      0x01
 
 // MSG_SET_ANGLE  – sent by the controller to a PID angle-based steering module.
 //   value1 = desired heading in degrees [0, 360).
@@ -64,6 +65,11 @@
 //   Contains GPS position, speed, course, and magnetic heading.
 //   See NavigationMessage struct below.
 #define MSG_NAV_STATUS        0x06
+
+// MSG_HEADING_HOLD_STATUS – broadcast by the navigation module at ~2 Hz.
+//   value1 = 1.0 if heading hold is active, 0.0 if manual.
+//   value2 = target heading in degrees [0, 360) when active, 0 otherwise.
+#define MSG_HEADING_HOLD_STATUS 0x07
 
 // ---------------------------------------------------------------------------
 // Button bitmask flags used in ControllerInputMessage.buttons

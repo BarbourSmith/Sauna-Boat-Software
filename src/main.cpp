@@ -8,7 +8,7 @@
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
 //
-// Mesh: accepts MSG_SET_SPEED commands from any module over ESP-NOW.
+// Mesh: accepts MSG_SET_STEERING commands from any module over ESP-NOW.
 // The soft-AP is pinned to MESH_WIFI_CHANNEL so both share one radio channel.
 
 #include <Arduino.h>
@@ -55,8 +55,19 @@ static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 static String g_settingsBody;
 
 // ---------------------------------------------------------------------------
+// Source-priority for MSG_SET_STEERING
+// ---------------------------------------------------------------------------
+// Both the controller and the navigation module send MSG_SET_STEERING.
+// The controller always sends (so steering works without the nav module).
+// When the nav module is actively sending (heading hold), its commands take
+// priority — controller commands are suppressed for a short window after each
+// nav command so the two don't fight.
+static constexpr unsigned long NAV_PRIORITY_MS = 600;  // suppress controller for this long after a nav command
+static unsigned long g_lastNavCmdTime = 0;             // timestamp of last nav module command
+
+// ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
-// Handles MSG_SET_SPEED from the controller module (or any future module).
+// Handles MSG_SET_STEERING from any module, with nav module taking priority.
 // Updating g_currentSpeed and g_lastCmdTime here is safe: both are 32-bit
 // aligned values and the ESP32 performs 32-bit loads/stores atomically.
 // ---------------------------------------------------------------------------
@@ -65,11 +76,23 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
     MeshMessage msg;
     memcpy(&msg, data, sizeof(msg));
 
-    if (msg.type == MSG_SET_SPEED) {
+    if (msg.type == MSG_SET_STEERING) {
+        unsigned long now = millis();
+
+        if (msg.src == MODULE_NAVIGATION) {
+            // Navigation module (heading hold) — always accepted, refreshes priority window.
+            g_lastNavCmdTime = now;
+        } else if (msg.src == MODULE_CONTROLLER) {
+            // Controller — suppressed while the nav module is actively commanding.
+            if ((now - g_lastNavCmdTime) < NAV_PRIORITY_MS) {
+                return;  // ignore — nav module has priority
+            }
+        }
+
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
-        g_lastCmdTime  = millis();  // keep the watchdog alive
+        g_lastCmdTime  = now;  // keep the watchdog alive
     }
 }
 
