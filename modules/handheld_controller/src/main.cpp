@@ -149,8 +149,8 @@ static void calibrateJoystick() {
         sy += analogRead(JOY_Y_PIN);
         delay(2);
     }
-    g_joyCenterX = (int)(sx / N);
-    g_joyCenterY = (int)(sy / N);
+    g_joyCenterX = (int)(sy / N);  // X axis reads from JOY_Y_PIN (swapped for mount orientation)
+    g_joyCenterY = (int)(sx / N);  // Y axis reads from JOY_X_PIN
 }
 
 // Convert a raw ADC reading to a signed [-1.0, 1.0] value with dead-zone.
@@ -189,10 +189,10 @@ struct JoystickReading {
 
 static JoystickReading readJoystick() {
     JoystickReading r;
-    r.rawX   = analogRead(JOY_X_PIN);
-    r.rawY   = analogRead(JOY_Y_PIN);
-    r.x      = joyNormalize(r.rawX, g_joyCenterX);
-    r.y      = joyNormalize(r.rawY, g_joyCenterY);
+    r.rawX   = analogRead(JOY_Y_PIN);
+    r.rawY   = analogRead(JOY_X_PIN);
+    r.x      = joyNormalize(r.rawX, g_joyCenterY);
+    r.y      = joyNormalize(r.rawY, g_joyCenterX);
     r.button = digitalRead(JOY_BTN_PIN) == LOW;
     return r;
 }
