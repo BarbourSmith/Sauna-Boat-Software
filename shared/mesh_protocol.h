@@ -26,7 +26,8 @@
 #define MODULE_STEERING    0x01
 #define MODULE_CONTROLLER  0x02
 #define MODULE_NAVIGATION  0x03
-// Add future modules here: #define MODULE_ENGINE 0x04, etc.
+#define MODULE_HANDHELD    0x04   // custom ESP32-S3 handheld with joystick + OLED
+// Add future modules here: #define MODULE_ENGINE 0x05, etc.
 
 // ---------------------------------------------------------------------------
 // Message types
