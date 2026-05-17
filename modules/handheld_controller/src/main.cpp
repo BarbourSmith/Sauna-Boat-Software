@@ -192,7 +192,7 @@ static JoystickReading readJoystick() {
     r.rawX   = analogRead(JOY_Y_PIN);
     r.rawY   = analogRead(JOY_X_PIN);
     r.x      = joyNormalize(r.rawX, g_joyCenterY);
-    r.y      = joyNormalize(r.rawY, g_joyCenterX);
+    r.y      = -joyNormalize(r.rawY, g_joyCenterX);
     r.button = digitalRead(JOY_BTN_PIN) == LOW;
     return r;
 }
