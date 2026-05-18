@@ -4,7 +4,7 @@
 // joystick, an SSD1306 0.96" OLED, an MPU-6050 (used for wake-on-motion),
 // and an on-board LiPo + battery monitor.
 //
-// Behaviour mirrors the PS3 `controller` module from the boat's perspective:
+// Behaviour from the boat's perspective:
 // it broadcasts MSG_CONTROLLER_INPUT and MSG_SET_STEERING over ESP-NOW on
 // MESH_WIFI_CHANNEL, so steering / navigation receivers need no changes.
 //
@@ -69,6 +69,8 @@ constexpr unsigned long SEND_INTERVAL_MS    = 50;    // 20 Hz mesh broadcast
 constexpr unsigned long DISPLAY_INTERVAL_MS = 100;   // 10 Hz OLED refresh
 constexpr unsigned long BATTERY_INTERVAL_MS = 5000;
 constexpr unsigned long LOG_INTERVAL_MS     = 1000;
+constexpr unsigned long MENU_NAV_REPEAT_MS  = 220;
+constexpr unsigned long MENU_BTN_DEBOUNCE_MS = 180;
 
 // ---------------------------------------------------------------------------
 // Sleep timeout — enter deep sleep after this much idle (no stick / button).
@@ -119,6 +121,23 @@ static uint32_t g_sendFailCount = 0;
 // Whether to arm the MPU-6050 motion interrupt before sleeping.
 // Toggleable via the "settings" preferences namespace, key `wakeOnMove`.
 static bool g_wakeOnMovement = true;
+
+enum class MenuScreen : uint8_t {
+    NONE,
+    ROOT,
+    NAVIGATION,
+    NAV_INFO,
+    BATTERY
+};
+
+static MenuScreen g_menuScreen = MenuScreen::NONE;
+static int g_menuSelectionRoot = 0;
+static int g_menuSelectionNav  = 0;
+static bool g_headingHoldEnabled = false;
+
+static bool g_prevButtonPressed = false;
+static unsigned long g_lastMenuMoveMs = 0;
+static unsigned long g_lastButtonEventMs = 0;
 
 // ---------------------------------------------------------------------------
 // Battery
@@ -259,7 +278,7 @@ static void sendBatteryStatus() {
     MeshMessage msg;
     msg.type   = MSG_CONTROLLER_STATUS;
     msg.src    = MODULE_HANDHELD;
-    // Re-use the PS3 battery scale: -1=unknown..4=full. Linear from %.
+    // Use the shared controller-status battery scale: -1=unknown..4=full.
     msg.value1 = (g_batteryPercent <= 0)  ? 0.0f
                : (g_batteryPercent < 25)  ? 1.0f
                : (g_batteryPercent < 50)  ? 2.0f
@@ -377,6 +396,82 @@ static void drawDisplay(const JoystickReading& joy) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
+    if (g_menuScreen != MenuScreen::NONE) {
+        auto drawMenuLine = [](int y, bool selected, const char* text) {
+            display.setCursor(0, y);
+            display.print(selected ? F("> ") : F("  "));
+            display.print(text);
+        };
+
+        if (g_menuScreen == MenuScreen::ROOT) {
+            display.setCursor(0, 0);
+            display.println(F("Menu"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            drawMenuLine(16, g_menuSelectionRoot == 0, "Navigation");
+            drawMenuLine(28, g_menuSelectionRoot == 1, "Battery");
+            drawMenuLine(40, g_menuSelectionRoot == 2, "Close");
+            display.setCursor(0, 54);
+            display.println(F("Up/Down + Click"));
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::NAVIGATION) {
+            display.setCursor(0, 0);
+            display.println(F("Navigation"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            drawMenuLine(16, g_menuSelectionNav == 0, "Info");
+            display.setCursor(0, 28);
+            display.print(g_menuSelectionNav == 1 ? F("> ") : F("  "));
+            display.print(F("Heading Hold: "));
+            display.print(g_headingHoldEnabled ? F("ON") : F("OFF"));
+            drawMenuLine(40, g_menuSelectionNav == 2, "Back");
+            display.setCursor(0, 54);
+            display.println(F("Click to select"));
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::NAV_INFO) {
+            display.setCursor(0, 0);
+            display.println(F("Nav Info"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            display.setCursor(0, 14);
+            display.printf("Sat: %u", g_navSatellites);
+            display.setCursor(64, 14);
+            display.printf("Fix: %u", g_navFixType);
+            display.setCursor(0, 24);
+            if (!isnan(g_navHeading)) display.printf("HDG: %5.1f", g_navHeading);
+            else                      display.print(F("HDG: ---"));
+            display.setCursor(0, 34);
+            if (!isnan(g_navCourse)) display.printf("COG: %5.1f", g_navCourse);
+            else                     display.print(F("COG: ---"));
+            display.setCursor(0, 44);
+            if (!isnan(g_navSpeedKnots)) display.printf("SOG: %4.1fkn", g_navSpeedKnots);
+            else                         display.print(F("SOG: ---"));
+            display.setCursor(0, 54);
+            display.println(F("Click: Back"));
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::BATTERY) {
+            display.setCursor(0, 0);
+            display.println(F("Battery"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.printf("%3d%%", g_batteryPercent);
+            display.setCursor(0, 30);
+            display.printf("%4.2fV", g_batteryVoltage);
+            display.setCursor(0, 44);
+            display.println(F("Details coming soon"));
+            display.setCursor(0, 54);
+            display.println(F("Click: Back"));
+            display.display();
+            return;
+        }
+    }
+
     // Top: battery + send status.
     display.setCursor(0, 0);
     display.printf("Bat %3d%% %4.2fV", g_batteryPercent, g_batteryVoltage);
@@ -428,6 +523,80 @@ static void drawDisplay(const JoystickReading& joy) {
     display.fillCircle(dotX, dotY, 2, SSD1306_WHITE);
 
     display.display();
+}
+
+static bool isMenuActive() {
+    return g_menuScreen != MenuScreen::NONE;
+}
+
+static void moveMenuSelection(int delta) {
+    if (delta == 0) return;
+    if (g_menuScreen == MenuScreen::ROOT) {
+        g_menuSelectionRoot += delta;
+        if (g_menuSelectionRoot < 0) g_menuSelectionRoot = 2;
+        if (g_menuSelectionRoot > 2) g_menuSelectionRoot = 0;
+    } else if (g_menuScreen == MenuScreen::NAVIGATION) {
+        g_menuSelectionNav += delta;
+        if (g_menuSelectionNav < 0) g_menuSelectionNav = 2;
+        if (g_menuSelectionNav > 2) g_menuSelectionNav = 0;
+    }
+}
+
+static void onMenuClick() {
+    if (g_menuScreen == MenuScreen::NONE) {
+        g_menuScreen = MenuScreen::ROOT;
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::ROOT) {
+        if (g_menuSelectionRoot == 0) g_menuScreen = MenuScreen::NAVIGATION;
+        else if (g_menuSelectionRoot == 1) g_menuScreen = MenuScreen::BATTERY;
+        else g_menuScreen = MenuScreen::NONE;
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::NAVIGATION) {
+        if (g_menuSelectionNav == 0) {
+            g_menuScreen = MenuScreen::NAV_INFO;
+        } else if (g_menuSelectionNav == 1) {
+            g_headingHoldEnabled = !g_headingHoldEnabled;
+        } else {
+            g_menuScreen = MenuScreen::ROOT;
+        }
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::NAV_INFO) {
+        g_menuScreen = MenuScreen::NAVIGATION;
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::BATTERY) {
+        g_menuScreen = MenuScreen::ROOT;
+    }
+}
+
+static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
+    bool buttonPressed = joy.button;
+    bool clicked = buttonPressed && !g_prevButtonPressed;
+
+    if (clicked && (now - g_lastButtonEventMs >= MENU_BTN_DEBOUNCE_MS)) {
+        onMenuClick();
+        g_lastButtonEventMs = now;
+    }
+
+    if (isMenuActive() && (g_menuScreen == MenuScreen::ROOT || g_menuScreen == MenuScreen::NAVIGATION)) {
+        int menuDelta = 0;
+        if (joy.y > 0.6f) menuDelta = -1;
+        else if (joy.y < -0.6f) menuDelta = 1;
+
+        if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            moveMenuSelection(menuDelta);
+            g_lastMenuMoveMs = now;
+        }
+    }
+
+    g_prevButtonPressed = buttonPressed;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +703,7 @@ void loop() {
     unsigned long now = millis();
 
     JoystickReading joy = readJoystick();
+    handleMenuInput(joy, now);
 
     // Activity detection: any deflection or button press resets the idle timer.
     if (fabsf(joy.x) > 0.05f || fabsf(joy.y) > 0.05f || joy.button) {
@@ -545,8 +715,17 @@ void loop() {
 
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
-        sendControllerInput(joy);
-        sendSteering(joy.x);
+        if (isMenuActive()) {
+            JoystickReading neutralJoy = joy;
+            neutralJoy.x = 0.0f;
+            neutralJoy.y = 0.0f;
+            neutralJoy.button = false;
+            sendControllerInput(neutralJoy);
+            sendSteering(0.0f);
+        } else {
+            sendControllerInput(joy);
+            sendSteering(joy.x);
+        }
     }
 
     if (now - lastDisplay >= DISPLAY_INTERVAL_MS) {
@@ -562,9 +741,11 @@ void loop() {
 
     if (now - lastLog >= LOG_INTERVAL_MS) {
         lastLog = now;
-        Serial.printf("[Loop] joy x=%+.2f y=%+.2f btn=%d | "
+        Serial.printf("[Loop] joy x=%+.2f y=%+.2f btn=%d | menu=%u hold=%d | "
                       "bat=%.2fV %d%% | mesh ok=%lu fail=%lu\n",
                       joy.x, joy.y, joy.button ? 1 : 0,
+                      (unsigned int)g_menuScreen,
+                      g_headingHoldEnabled ? 1 : 0,
                       g_batteryVoltage, g_batteryPercent,
                       (unsigned long)g_sendOkCount,
                       (unsigned long)g_sendFailCount);

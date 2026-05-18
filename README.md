@@ -18,9 +18,6 @@ message, and any other module can listen and act on it.
     │   ├── platformio.ini
     │   ├── src/             ← C++ firmware
     │   └── data/            ← LittleFS web UI (index.html)
-    ├── controller/          ← plain ESP32; reads a PS3 controller via Bluetooth
-    │   ├── platformio.ini
-    │   └── src/             ← C++ firmware
     └── handheld_controller/ ← ESP32-S3 (Pavloff board); custom handheld with
         ├── platformio.ini     analog joystick, SSD1306 OLED, MPU-6050 wake-on-
         └── src/               motion, and on-board LiPo
@@ -55,40 +52,16 @@ pio run -t uploadfs     # flash web UI (index.html → LittleFS)
 
 ---
 
-### `controller` — ESP32 (plain, not S3)
-
-Connects to a PS3 DualShock 3 controller via Bluetooth and translates joystick
-input into heading commands sent to the steering module over ESP-NOW.
-
-**Left stick X-axis** → heading change rate (max ±90 °/s at full deflection).
-Stick centred → hold current heading.
-
-**One-time pairing (required before first use):**
-1. Flash the firmware and open the serial monitor.
-2. Note the **Bluetooth MAC** printed on startup.
-3. Use [SixaxisPairTool](https://github.com/user-attachments/files/11638679/SixaxisPairTool-0.3.1.zip) (Windows/Mac)
-   or `sixaxispairer` (Linux) to write that MAC into your PS3 controller.
-4. Press the **PS button** on the controller — it connects automatically.
-
-**Build & flash:**
-```bash
-cd modules/controller
-pio run -t upload
-```
-
----
-
 ### `handheld_controller` — ESP32-S3 (Pavloff board)
 
-Custom handheld controller built on the Pavloff PCB. Replaces the PS3
-controller with a self-contained device: analog joystick for steering, a
+Custom handheld controller built on the Pavloff PCB. It is a self-contained
+input device with an analog joystick for steering, a
 0.96" SSD1306 OLED for live boat telemetry, an on-board LiPo with battery
 monitor, and an MPU-6050 used as a wake-on-motion source.
 
 It joins the boat over the existing ESP-NOW mesh on `MESH_WIFI_CHANNEL`
 (no Bluetooth, no pairing) and broadcasts the same `MSG_CONTROLLER_INPUT`
-and `MSG_SET_STEERING` messages as the PS3 module — so steering and
-navigation receivers work with either controller unchanged.
+and `MSG_SET_STEERING` messages expected by steering and navigation receivers.
 
 **Stick X-axis** → `MSG_SET_STEERING.value1` in `[-1.0, 1.0]` (raw, no
 deadzone applied here beyond the joystick centring band).
@@ -136,7 +109,7 @@ All inter-module traffic uses the structs and constants in `shared/mesh_protocol
 
 | Message | Type byte | Sender | value1 | value2 |
 |---------|-----------|--------|--------|--------|
-| `MSG_SET_ANGLE` | `0x01` | controller | target heading (°) | — |
+| `MSG_SET_STEERING` | `0x01` | handheld_controller / navigation | normalized steering [-1.0, 1.0] | — |
 | `MSG_ANGLE_STATUS` | `0x02` | steering | current angle (°) | target angle (°) |
 
 All modules use **WiFi channel 1** (`MESH_WIFI_CHANNEL`). The steering module's
@@ -150,9 +123,4 @@ the same radio.
 | Board | Module | Chip |
 |-------|--------|------|
 | Maslow 4 | steering | ESP32-S3 |
-| Generic dev board | controller | ESP32 (not S3) |
 | Pavloff PCB | handheld_controller | ESP32-S3 (battery + MPU-6050 on-board) |
-
-The PS3 controller communicates over Bluetooth; the ESP32-S3 used by the
-steering module does not have the correct Bluetooth stack for `esp32-ps3`, which
-is why the controller module uses a plain ESP32.

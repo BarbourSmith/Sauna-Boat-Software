@@ -452,8 +452,7 @@ void setup() {
 
     // --- WiFi AP+STA + ESP-NOW ---
     // AP_STA mode is required so the STA interface is available for ESP-NOW
-    // reception (the controller module transmits on its STA interface) while
-    // the AP interface serves the web UI.
+    // reception while the AP interface serves the web UI.
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS, MESH_WIFI_CHANNEL);
     WiFi.disconnect();  // STA not joining any network, just kept active for ESP-NOW
@@ -475,7 +474,7 @@ void setup() {
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
     peer.channel = MESH_WIFI_CHANNEL;
-    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface (matches controller)
+    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface
     peer.encrypt = false;
     if (esp_now_add_peer(&peer) == ESP_OK) {
         Serial.println("[Setup] Broadcast peer registered.");

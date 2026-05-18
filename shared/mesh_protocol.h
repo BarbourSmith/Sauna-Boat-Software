@@ -24,7 +24,7 @@
 // Module IDs (source field in every message)
 // ---------------------------------------------------------------------------
 #define MODULE_STEERING    0x01
-#define MODULE_CONTROLLER  0x02
+// 0x02 reserved for legacy sender IDs
 #define MODULE_NAVIGATION  0x03
 #define MODULE_HANDHELD    0x04   // custom ESP32-S3 handheld with joystick + OLED
 // Add future modules here: #define MODULE_ENGINE 0x05, etc.
@@ -32,14 +32,14 @@
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
-// MSG_SET_STEERING – sent by the controller (or navigation module) to the
+// MSG_SET_STEERING – sent by manual input modules and/or the navigation module to the
 //   steering module.
 //   value1 = normalized rudder position [-1.0, 1.0].
 //             Negative = port/left, positive = starboard/right.
 //   value2 = unused (0).
 #define MSG_SET_STEERING      0x01
 
-// MSG_SET_ANGLE  – sent by the controller to a PID angle-based steering module.
+// MSG_SET_ANGLE  – sent by an input module to a PID angle-based steering module.
 //   value1 = desired heading in degrees [0, 360).
 //   value2 = unused (0).
 #define MSG_SET_ANGLE      0x02
@@ -49,16 +49,16 @@
 //   value2 = current target angle   (degrees).
 #define MSG_ANGLE_STATUS   0x03
 
-// MSG_CONTROLLER_STATUS – broadcast by the controller module at ~0.2 Hz.
-//   value1 = PS3 battery level:  -1=unknown, 0=shutdown, 1=dying, 2=low,
+// MSG_CONTROLLER_STATUS – broadcast by an input module at ~0.2 Hz.
+//   value1 = input-device battery level: -1=unknown, 0=shutdown, 1=dying, 2=low,
 //                                 3=high, 4=full.
 //   value2 = charging flag:       1.0 = plugged in and charging, 0.0 = on battery.
 #define MSG_CONTROLLER_STATUS 0x04
 
-// MSG_CONTROLLER_INPUT – raw PS3 controller state, broadcast by the controller
+// MSG_CONTROLLER_INPUT – raw input-device state, broadcast by a controller source
 //   at ~20 Hz.  The receiving module decides how to interpret the inputs.
 //   All analog values are normalised to [-1.0, 1.0] with NO dead-zone applied.
-//   Sent even when the PS3 controller is disconnected (all fields zero).
+//   Sent even when the input device is disconnected or idle (all fields zero).
 //   See ControllerInputMessage struct and CTRL_BTN_* bitmask flags below.
 #define MSG_CONTROLLER_INPUT  0x05
 
@@ -103,11 +103,11 @@ struct MeshMessage {
     float   value2;  // secondary payload value (0 if unused)
 };  // 10 bytes
 
-// Raw PS3 controller state.  All analog axes are normalised; dead-zone is
+// Raw controller/input state.  All analog axes are normalised; dead-zone is
 // intentionally NOT applied here so each receiving module can choose its own.
 struct ControllerInputMessage {
     uint8_t  type;     // MSG_CONTROLLER_INPUT
-    uint8_t  src;      // MODULE_CONTROLLER
+    uint8_t  src;      // sender module ID (MODULE_HANDHELD or other input module)
     float    lx;       // left  stick X, [-1.0, 1.0]  (negative = left)
     float    ly;       // left  stick Y, [-1.0, 1.0]  (negative = up)
     float    rx;       // right stick X, [-1.0, 1.0]

@@ -8,7 +8,7 @@
 // Web interface: Connect to WiFi AP "SaunaBoatSteering" (password: 12345678)
 // Then open http://192.168.4.1 in a browser.
 //
-// Mesh: accepts MSG_CONTROLLER_INPUT from the controller module over ESP-NOW.
+// Mesh: accepts MSG_CONTROLLER_INPUT from input modules over ESP-NOW.
 // Raw stick and button state is received here; this module applies dead-zone
 // and interprets D-pad left/right as trim jog commands.
 // The soft-AP is pinned to MESH_WIFI_CHANNEL so both share one radio channel.
@@ -123,7 +123,7 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         g_currentSpeed = speed;
 
     } else if (type == MSG_SET_STEERING) {
-        // Legacy fallback: accept pre-computed speed from older controller firmware.
+        // Legacy fallback: accept pre-computed speed from any sender.
         if (len < static_cast<int>(sizeof(MeshMessage))) return;
         MeshMessage msg;
         memcpy(&msg, data, sizeof(msg));
