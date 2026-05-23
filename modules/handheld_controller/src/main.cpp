@@ -8,12 +8,13 @@
 // it broadcasts MSG_CONTROLLER_INPUT and MSG_SET_STEERING over ESP-NOW on
 // MESH_WIFI_CHANNEL, so steering / navigation receivers need no changes.
 //
-// Display shows boat telemetry (heading, GPS fix, target heading) received
-// from the navigation and steering modules, plus local battery %.
+// Display shows controller diagnostics (battery, Wi-Fi/ESP-NOW link status,
+// steering status, joystick values) for field debugging.
 //
 // Power management: after IDLE_SLEEP_MS of no joystick deflection or button
 // press the board enters deep sleep. It wakes on either MPU-6050 motion
-// (EXT1 / GPIO 18) or the joystick button (EXT0 / GPIO 6 pulled LOW).
+// (EXT1 / GPIO 18) or joystick button click (EXT0 / GPIO 6 pulled LOW),
+// depending on settings.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -32,8 +33,8 @@
 // ---------------------------------------------------------------------------
 // Pin definitions — Pavloff board (fixed)
 // ---------------------------------------------------------------------------
-#define SDA_PIN        8   // I2C SDA — MPU-6050 + OLED share this bus
-#define SCL_PIN        9   // I2C SCL
+#define SDA_PIN       15   // I2C SDA — MPU-6050 + OLED share this bus
+#define SCL_PIN       16   // I2C SCL
 #define MPU_INT_PIN   18   // MPU-6050 INT → EXT1 wake-up source
 #define BATTERY_PIN    7   // ADC battery voltage divider
 #define BLUE_LED_PIN  47   // Status LED (active HIGH)
@@ -61,6 +62,9 @@ constexpr float BATTERY_VOLTAGE_EMPTY = 3.00f;
 constexpr int   JOY_ADC_MAX        = 4095;
 constexpr int   JOY_DEAD_COUNTS    = 120;   // raw counts around centre treated as zero
 constexpr float JOY_OUTPUT_GAMMA   = 1.0f;  // >1 = softer near centre; 1 = linear
+constexpr int   STEERING_TRIM_MIN  = -600;
+constexpr int   STEERING_TRIM_MAX  = 600;
+constexpr int   STEERING_TRIM_STEP = 10;
 
 // ---------------------------------------------------------------------------
 // Loop timing
@@ -75,6 +79,7 @@ constexpr unsigned long MENU_BTN_DEBOUNCE_MS = 180;
 // ---------------------------------------------------------------------------
 // Sleep timeout — enter deep sleep after this much idle (no stick / button).
 // ---------------------------------------------------------------------------
+constexpr bool DISABLE_SLEEP_FOR_DEBUG = false;         // keep false for normal operation
 constexpr unsigned long IDLE_SLEEP_MS = 60UL * 1000UL;  // 1 minute
 
 // ---------------------------------------------------------------------------
@@ -93,6 +98,7 @@ Preferences       preferences;
 
 static int   g_joyCenterX     = 2048;
 static int   g_joyCenterY     = 2048;
+static int   g_steeringTrimCounts = 0;
 static bool  g_oledOk         = false;
 static bool  g_mpuOk          = false;
 
@@ -117,6 +123,16 @@ static unsigned long g_lastActivityMs  = 0;
 // ESP-NOW diagnostics
 static uint32_t g_sendOkCount   = 0;
 static uint32_t g_sendFailCount = 0;
+static bool g_lastSendOk        = false;
+static unsigned long g_lastSendMs = 0;
+
+// Whether inactivity timeout is allowed to put the controller into deep sleep.
+// Toggleable via the menu settings and persisted under `idleSleep`.
+static bool g_idleSleepEnabled = true;
+
+// Whether joystick click (EXT0 on JOY_BTN_PIN) is armed as a wake source.
+// Toggleable via the "settings" preferences namespace, key `wakeOnClick`.
+static bool g_wakeOnClick = true;
 
 // Whether to arm the MPU-6050 motion interrupt before sleeping.
 // Toggleable via the "settings" preferences namespace, key `wakeOnMove`.
@@ -125,15 +141,19 @@ static bool g_wakeOnMovement = true;
 enum class MenuScreen : uint8_t {
     NONE,
     ROOT,
+    SETTINGS,
     NAVIGATION,
     NAV_INFO,
+    STEERING_TRIM,
     BATTERY
 };
 
 static MenuScreen g_menuScreen = MenuScreen::NONE;
 static int g_menuSelectionRoot = 0;
+static int g_menuSelectionSettings = 0;
 static int g_menuSelectionNav  = 0;
 static bool g_headingHoldEnabled = false;
+static bool g_settingsDirty = false;
 
 static bool g_prevButtonPressed = false;
 static unsigned long g_lastMenuMoveMs = 0;
@@ -170,6 +190,36 @@ static void calibrateJoystick() {
     }
     g_joyCenterX = (int)(sy / N);  // X axis reads from JOY_Y_PIN (swapped for mount orientation)
     g_joyCenterY = (int)(sx / N);  // Y axis reads from JOY_X_PIN
+}
+
+static int steeringCenterCounts() {
+    return constrain(g_joyCenterY + g_steeringTrimCounts,
+                     JOY_DEAD_COUNTS + 1,
+                     JOY_ADC_MAX - JOY_DEAD_COUNTS - 1);
+}
+
+static void loadSettings() {
+    preferences.begin("settings", true);
+    g_idleSleepEnabled = preferences.getBool("idleSleep", true);
+    g_wakeOnClick = preferences.getBool("wakeOnClick", true);
+    g_wakeOnMovement = preferences.getBool("wakeOnMove", true);
+    g_steeringTrimCounts = preferences.getInt("steerTrim", 0);
+    preferences.end();
+
+    g_steeringTrimCounts = constrain(g_steeringTrimCounts,
+                                     STEERING_TRIM_MIN,
+                                     STEERING_TRIM_MAX);
+    g_settingsDirty = false;
+}
+
+static void saveSettings() {
+    preferences.begin("settings", false);
+    preferences.putBool("idleSleep", g_idleSleepEnabled);
+    preferences.putBool("wakeOnClick", g_wakeOnClick);
+    preferences.putBool("wakeOnMove", g_wakeOnMovement);
+    preferences.putInt("steerTrim", g_steeringTrimCounts);
+    preferences.end();
+    g_settingsDirty = false;
 }
 
 // Convert a raw ADC reading to a signed [-1.0, 1.0] value with dead-zone.
@@ -210,7 +260,7 @@ static JoystickReading readJoystick() {
     JoystickReading r;
     r.rawX   = analogRead(JOY_Y_PIN);
     r.rawY   = analogRead(JOY_X_PIN);
-    r.x      = joyNormalize(r.rawX, g_joyCenterY);
+    r.x      = joyNormalize(r.rawX, steeringCenterCounts());
     r.y      = -joyNormalize(r.rawY, g_joyCenterX);
     r.button = digitalRead(JOY_BTN_PIN) == LOW;
     return r;
@@ -220,8 +270,10 @@ static JoystickReading readJoystick() {
 // ESP-NOW
 // ---------------------------------------------------------------------------
 static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t status) {
-    if (status == ESP_NOW_SEND_SUCCESS) ++g_sendOkCount;
-    else                                ++g_sendFailCount;
+    g_lastSendOk = (status == ESP_NOW_SEND_SUCCESS);
+    g_lastSendMs = millis();
+    if (g_lastSendOk) ++g_sendOkCount;
+    else              ++g_sendFailCount;
 }
 
 static void onDataRecv(const uint8_t* /*mac*/,
@@ -264,11 +316,19 @@ static void sendControllerInput(const JoystickReading& joy) {
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
 }
 
+static float steeringTrimBias() {
+    // Convert trim counts to a steering-space offset and clamp to safe range.
+    constexpr float spanCounts = (JOY_ADC_MAX / 2.0f) - JOY_DEAD_COUNTS;
+    if (spanCounts <= 1.0f) return 0.0f;
+    return constrain((float)g_steeringTrimCounts / spanCounts, -1.0f, 1.0f);
+}
+
 static void sendSteering(float stickX) {
     MeshMessage msg;
     msg.type   = MSG_SET_STEERING;
     msg.src    = MODULE_HANDHELD;
-    msg.value1 = constrain(stickX, -1.0f, 1.0f);
+    float steerCmd = stickX + steeringTrimBias();
+    msg.value1 = constrain(steerCmd, -1.0f, 1.0f);
     msg.value2 = 0.0f;
     esp_now_send(MESH_BROADCAST_ADDR,
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
@@ -335,6 +395,7 @@ static void wakeupMPU() {
 // ---------------------------------------------------------------------------
 static void enterDeepSleep() {
     Serial.println("\n[Sleep] Entering deep sleep…");
+    bool hasWakeSource = false;
 
     // Show a brief sleep notice on the OLED, then power it down.
     if (g_oledOk) {
@@ -354,10 +415,13 @@ static void enterDeepSleep() {
     gpio_hold_en((gpio_num_t)BLUE_LED_PIN);
     gpio_deep_sleep_hold_en();
 
-    // EXT0: joystick button (active LOW) — single-pin, low-pin-count wake.
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)JOY_BTN_PIN, 0);
-    gpio_pullup_en((gpio_num_t)JOY_BTN_PIN);
-    gpio_pulldown_dis((gpio_num_t)JOY_BTN_PIN);
+    // EXT0: joystick button (active LOW) — optional wake-on-click source.
+    if (g_wakeOnClick) {
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)JOY_BTN_PIN, 0);
+        gpio_pullup_en((gpio_num_t)JOY_BTN_PIN);
+        gpio_pulldown_dis((gpio_num_t)JOY_BTN_PIN);
+        hasWakeSource = true;
+    }
 
     // EXT1: MPU-6050 motion interrupt (active HIGH).
     if (g_wakeOnMovement && g_mpuOk) {
@@ -378,8 +442,17 @@ static void enterDeepSleep() {
         esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
         gpio_pulldown_en((gpio_num_t)MPU_INT_PIN);
         gpio_pullup_dis((gpio_num_t)MPU_INT_PIN);
+        hasWakeSource = true;
     } else if (g_mpuOk) {
         mpu.setSleepEnabled(true);
+    }
+
+    // Never enter deep sleep without any wake source configured.
+    if (!hasWakeSource) {
+        Serial.println("[Sleep] No wake source enabled; forcing wake-on-click");
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)JOY_BTN_PIN, 0);
+        gpio_pullup_en((gpio_num_t)JOY_BTN_PIN);
+        gpio_pulldown_dis((gpio_num_t)JOY_BTN_PIN);
     }
 
     delay(50);
@@ -407,11 +480,37 @@ static void drawDisplay(const JoystickReading& joy) {
             display.setCursor(0, 0);
             display.println(F("Menu"));
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
-            drawMenuLine(16, g_menuSelectionRoot == 0, "Navigation");
-            drawMenuLine(28, g_menuSelectionRoot == 1, "Battery");
-            drawMenuLine(40, g_menuSelectionRoot == 2, "Close");
-            display.setCursor(0, 54);
-            display.println(F("Up/Down + Click"));
+            drawMenuLine(14, g_menuSelectionRoot == 0, "Navigation");
+            drawMenuLine(24, g_menuSelectionRoot == 1, "Settings");
+            drawMenuLine(34, g_menuSelectionRoot == 2, "Steering Trim");
+            drawMenuLine(44, g_menuSelectionRoot == 3, "Battery");
+            drawMenuLine(54, g_menuSelectionRoot == 4, "Close");
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::SETTINGS) {
+            display.setCursor(0, 0);
+            display.println(F("Settings"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+
+            display.setCursor(0, 16);
+            display.print(g_menuSelectionSettings == 0 ? F("> ") : F("  "));
+            display.print(F("Sleep Timeout: "));
+            display.print(g_idleSleepEnabled ? F("ON") : F("OFF"));
+
+            display.setCursor(0, 26);
+            display.print(g_menuSelectionSettings == 1 ? F("> ") : F("  "));
+            display.print(F("Wake on Click: "));
+            display.print(g_wakeOnClick ? F("ON") : F("OFF"));
+
+            display.setCursor(0, 36);
+            display.print(g_menuSelectionSettings == 2 ? F("> ") : F("  "));
+            display.print(F("Wake on Move: "));
+            display.print(g_wakeOnMovement ? F("ON") : F("OFF"));
+
+            drawMenuLine(46, g_menuSelectionSettings == 3, "Sleep Now");
+            drawMenuLine(56, g_menuSelectionSettings == 4, "Back");
             display.display();
             return;
         }
@@ -455,6 +554,22 @@ static void drawDisplay(const JoystickReading& joy) {
             return;
         }
 
+        if (g_menuScreen == MenuScreen::STEERING_TRIM) {
+            display.setCursor(0, 0);
+            display.println(F("Steering Trim"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.printf("Trim: %+4d", g_steeringTrimCounts);
+            display.setCursor(0, 30);
+            display.printf("Ctr : %4d", steeringCenterCounts());
+            display.setCursor(0, 42);
+            display.println(F("Left/Right adjust"));
+            display.setCursor(0, 54);
+            display.println(F("Click: Back"));
+            display.display();
+            return;
+        }
+
         if (g_menuScreen == MenuScreen::BATTERY) {
             display.setCursor(0, 0);
             display.println(F("Battery"));
@@ -472,7 +587,7 @@ static void drawDisplay(const JoystickReading& joy) {
         }
     }
 
-    // Top: battery + send status.
+    // Top: battery + receive-link heartbeat.
     display.setCursor(0, 0);
     display.printf("Bat %3d%% %4.2fV", g_batteryPercent, g_batteryVoltage);
     display.setCursor(96, 0);
@@ -481,26 +596,25 @@ static void drawDisplay(const JoystickReading& joy) {
 
     display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
 
-    // Heading + GPS fix
+    // Wi-Fi / ESP-NOW diagnostics (replaces heading/satellite fields).
     display.setCursor(0, 14);
-    if (!isnan(g_navHeading)) {
-        display.printf("HDG %5.1f", g_navHeading);
-    } else {
-        display.print(F("HDG  ---"));
-    }
+    display.printf("WiFi ch%u", (unsigned int)MESH_WIFI_CHANNEL);
     display.setCursor(72, 14);
-    display.printf("Sat %2u", g_navSatellites);
+    display.printf("Fix %u", g_navFixType);
 
     display.setCursor(0, 26);
-    if (!isnan(g_navSpeedKnots)) {
-        display.printf("SOG %4.1fkn", g_navSpeedKnots);
+    if (g_lastSendMs != 0) {
+        unsigned long txAgeMs = millis() - g_lastSendMs;
+        display.printf("TX %s %4lums", g_lastSendOk ? "OK" : "FL", txAgeMs);
     } else {
-        display.print(F("SOG --"));
+        display.print(F("TX --"));
     }
     display.setCursor(72, 26);
-    display.print(g_navFixType > 0 ? F("FIX") : F("---"));
+    display.printf("%lu/%lu",
+                   (unsigned long)g_sendOkCount,
+                   (unsigned long)g_sendFailCount);
 
-    // Steering target / actual
+    // Steering target / actual from boat feedback.
     display.setCursor(0, 38);
     if (!isnan(g_steeringAngle)) {
         display.printf("RUD %5.1f -> %5.1f", g_steeringAngle, g_steeringTarget);
@@ -533,13 +647,29 @@ static void moveMenuSelection(int delta) {
     if (delta == 0) return;
     if (g_menuScreen == MenuScreen::ROOT) {
         g_menuSelectionRoot += delta;
-        if (g_menuSelectionRoot < 0) g_menuSelectionRoot = 2;
-        if (g_menuSelectionRoot > 2) g_menuSelectionRoot = 0;
+        if (g_menuSelectionRoot < 0) g_menuSelectionRoot = 4;
+        if (g_menuSelectionRoot > 4) g_menuSelectionRoot = 0;
+    } else if (g_menuScreen == MenuScreen::SETTINGS) {
+        g_menuSelectionSettings += delta;
+        if (g_menuSelectionSettings < 0) g_menuSelectionSettings = 4;
+        if (g_menuSelectionSettings > 4) g_menuSelectionSettings = 0;
     } else if (g_menuScreen == MenuScreen::NAVIGATION) {
         g_menuSelectionNav += delta;
         if (g_menuSelectionNav < 0) g_menuSelectionNav = 2;
         if (g_menuSelectionNav > 2) g_menuSelectionNav = 0;
     }
+}
+
+static void adjustSteeringTrim(int delta) {
+    if (delta == 0) return;
+
+    int nextTrim = constrain(g_steeringTrimCounts + delta,
+                             STEERING_TRIM_MIN,
+                             STEERING_TRIM_MAX);
+    if (nextTrim == g_steeringTrimCounts) return;
+
+    g_steeringTrimCounts = nextTrim;
+    g_settingsDirty = true;
 }
 
 static void onMenuClick() {
@@ -550,8 +680,30 @@ static void onMenuClick() {
 
     if (g_menuScreen == MenuScreen::ROOT) {
         if (g_menuSelectionRoot == 0) g_menuScreen = MenuScreen::NAVIGATION;
-        else if (g_menuSelectionRoot == 1) g_menuScreen = MenuScreen::BATTERY;
+        else if (g_menuSelectionRoot == 1) g_menuScreen = MenuScreen::SETTINGS;
+        else if (g_menuSelectionRoot == 2) g_menuScreen = MenuScreen::STEERING_TRIM;
+        else if (g_menuSelectionRoot == 3) g_menuScreen = MenuScreen::BATTERY;
         else g_menuScreen = MenuScreen::NONE;
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::SETTINGS) {
+        if (g_menuSelectionSettings == 0) {
+            g_idleSleepEnabled = !g_idleSleepEnabled;
+            g_settingsDirty = true;
+        } else if (g_menuSelectionSettings == 1) {
+            g_wakeOnClick = !g_wakeOnClick;
+            g_settingsDirty = true;
+        } else if (g_menuSelectionSettings == 2) {
+            g_wakeOnMovement = !g_wakeOnMovement;
+            g_settingsDirty = true;
+        } else if (g_menuSelectionSettings == 3) {
+            if (g_settingsDirty) saveSettings();
+            enterDeepSleep();
+        } else {
+            if (g_settingsDirty) saveSettings();
+            g_menuScreen = MenuScreen::ROOT;
+        }
         return;
     }
 
@@ -571,6 +723,12 @@ static void onMenuClick() {
         return;
     }
 
+    if (g_menuScreen == MenuScreen::STEERING_TRIM) {
+        if (g_settingsDirty) saveSettings();
+        g_menuScreen = MenuScreen::ROOT;
+        return;
+    }
+
     if (g_menuScreen == MenuScreen::BATTERY) {
         g_menuScreen = MenuScreen::ROOT;
     }
@@ -585,13 +743,24 @@ static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
         g_lastButtonEventMs = now;
     }
 
-    if (isMenuActive() && (g_menuScreen == MenuScreen::ROOT || g_menuScreen == MenuScreen::NAVIGATION)) {
+    if (isMenuActive() && (g_menuScreen == MenuScreen::ROOT ||
+                           g_menuScreen == MenuScreen::SETTINGS ||
+                           g_menuScreen == MenuScreen::NAVIGATION)) {
         int menuDelta = 0;
         if (joy.y > 0.6f) menuDelta = -1;
         else if (joy.y < -0.6f) menuDelta = 1;
 
         if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
             moveMenuSelection(menuDelta);
+            g_lastMenuMoveMs = now;
+        }
+    } else if (g_menuScreen == MenuScreen::STEERING_TRIM) {
+        int trimDelta = 0;
+        if (joy.x > 0.6f) trimDelta = STEERING_TRIM_STEP;
+        else if (joy.x < -0.6f) trimDelta = -STEERING_TRIM_STEP;
+
+        if (trimDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            adjustSteeringTrim(trimDelta);
             g_lastMenuMoveMs = now;
         }
     }
@@ -620,11 +789,18 @@ void setup() {
 
     pinMode(JOY_BTN_PIN, INPUT_PULLUP);
 
-    preferences.begin("settings", true);
-    g_wakeOnMovement = preferences.getBool("wakeOnMove", true);
-    preferences.end();
+    loadSettings();
+    Serial.printf("[Setup] idle sleep timeout = %s\n",
+                  g_idleSleepEnabled ? "ENABLED" : "DISABLED");
+    Serial.printf("[Setup] wake-on-click = %s\n",
+                  g_wakeOnClick ? "ENABLED" : "DISABLED");
     Serial.printf("[Setup] wake-on-movement = %s\n",
                   g_wakeOnMovement ? "ENABLED" : "DISABLED");
+    Serial.printf("[Setup] steering trim = %+d counts (center=%d)\n",
+                  g_steeringTrimCounts, steeringCenterCounts());
+    if (DISABLE_SLEEP_FOR_DEBUG) {
+        Serial.println("[Setup] DEBUG: idle deep sleep is DISABLED");
+    }
 
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     switch (wake) {
@@ -741,17 +917,19 @@ void loop() {
 
     if (now - lastLog >= LOG_INTERVAL_MS) {
         lastLog = now;
-        Serial.printf("[Loop] joy x=%+.2f y=%+.2f btn=%d | menu=%u hold=%d | "
-                      "bat=%.2fV %d%% | mesh ok=%lu fail=%lu\n",
+        Serial.printf("[Loop] joy x=%+.2f y=%+.2f btn=%d | menu=%u hold=%d trim=%+d | "
+                  "bat=%.2fV %d%% | mesh ok=%lu fail=%lu\n",
                       joy.x, joy.y, joy.button ? 1 : 0,
                       (unsigned int)g_menuScreen,
                       g_headingHoldEnabled ? 1 : 0,
+                  g_steeringTrimCounts,
                       g_batteryVoltage, g_batteryPercent,
                       (unsigned long)g_sendOkCount,
                       (unsigned long)g_sendFailCount);
     }
 
-    if (now - g_lastActivityMs >= IDLE_SLEEP_MS) {
+    if (!DISABLE_SLEEP_FOR_DEBUG && g_idleSleepEnabled &&
+        now - g_lastActivityMs >= IDLE_SLEEP_MS) {
         enterDeepSleep();
     }
 
