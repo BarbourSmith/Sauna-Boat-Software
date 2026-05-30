@@ -43,14 +43,6 @@ static Preferences    prefs;
 // Most recent normalized speed command received from the UI (-1.0 to 1.0).
 static float          g_currentSpeed = 0.0f;
 
-// Timestamp of the last speed command received over WebSocket (ms).
-// Used by the watchdog to stop the motor on connection loss.
-static unsigned long  g_lastCmdTime  = 0;
-
-// Motor stops if no speed command arrives within this window (milliseconds).
-// Set to 200 ms so the motor stops if even one 100 ms heartbeat is missed.
-static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
-
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
 
@@ -92,7 +84,6 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
-        g_lastCmdTime  = now;  // keep the watchdog alive
     }
 }
 
@@ -129,7 +120,6 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
                 speed = constrain(speed, -1.0f, 1.0f);
                 steeringMotor.setSpeed(speed);
                 g_currentSpeed = speed;
-                g_lastCmdTime  = millis();
             }
         }
     }
@@ -290,14 +280,6 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
-    // Safety watchdog: if no speed command has been received for WATCHDOG_TIMEOUT_MS
-    // and the servo is active, center it (handles network loss or browser close).
-    if (g_currentSpeed != 0.0f && (millis() - g_lastCmdTime) > WATCHDOG_TIMEOUT_MS) {
-        Serial.println("[Loop] Watchdog: no recent command – centering servo.");
-        steeringMotor.stop();
-        g_currentSpeed = 0.0f;
-    }
-
     // Periodically log diagnostics to serial for debugging
     static unsigned long lastDiag = 0;
     if (millis() - lastDiag >= 500) {

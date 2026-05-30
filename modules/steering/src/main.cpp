@@ -45,10 +45,6 @@ static Preferences    prefs;
 // Most recent normalized speed command received from the UI (-1.0 to 1.0).
 static float          g_currentSpeed = 0.0f;
 
-// Timestamp of the last speed command received over mesh or WebSocket (ms).
-// Used by the watchdog to stop the motor on connection loss.
-static unsigned long  g_lastCmdTime  = 0;
-
 // Trim state – D-pad left/right nudge the servo centre offset while held.
 // The value is applied inside MotorUnit::updateRamp() as a position offset.
 // g_trimDirty is set whenever trim changes; the loop saves it to NVS once
@@ -56,10 +52,6 @@ static unsigned long  g_lastCmdTime  = 0;
 static uint16_t       g_prevButtons        = 0;
 static unsigned long  g_trimLastChange     = 0;
 static bool           g_trimDirty         = false;
-
-// Motor stops if no command arrives within this window (milliseconds).
-// Set to 200 ms so the motor stops if even one 100 ms heartbeat is missed.
-static constexpr unsigned long WATCHDOG_TIMEOUT_MS = 200;
 
 // Dead-zone applied to raw left-stick X from MSG_CONTROLLER_INPUT.
 // Sticks naturally drift; anything within this band is treated as centred.
@@ -88,8 +80,6 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         if (len < static_cast<int>(sizeof(ControllerInputMessage))) return;
         ControllerInputMessage msg;
         memcpy(&msg, data, sizeof(msg));
-
-        g_lastCmdTime = millis();  // keep the watchdog alive
 
         // D-pad left/right: adjust trim while the button is held (level-triggered).
         // Each 50 ms frame the button is held nudges the servo centre by TRIM_STEP.
@@ -130,7 +120,6 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
-        g_lastCmdTime  = millis();
     }
 }
 
@@ -167,7 +156,6 @@ static void onWsEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
                 speed = constrain(speed, -1.0f, 1.0f);
                 steeringMotor.setSpeed(speed);
                 g_currentSpeed = speed;
-                g_lastCmdTime  = millis();
             }
         }
     }
@@ -310,14 +298,6 @@ void loop() {
         prefs.putFloat("trim", steeringMotor.getTrim());
         g_trimDirty = false;
         Serial.printf("[Trim] Saved to NVS: %.4f\n", steeringMotor.getTrim());
-    }
-
-    // Safety watchdog: if no speed command has been received for WATCHDOG_TIMEOUT_MS
-    // and the servo is active, center it (handles network loss or browser close).
-    if (g_currentSpeed != 0.0f && (millis() - g_lastCmdTime) > WATCHDOG_TIMEOUT_MS) {
-        Serial.println("[Loop] Watchdog: no recent command – centering servo.");
-        steeringMotor.stop();
-        g_currentSpeed = 0.0f;
     }
 
     // Periodically log diagnostics to serial for debugging
