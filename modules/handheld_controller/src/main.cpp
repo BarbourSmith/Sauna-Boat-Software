@@ -58,7 +58,7 @@ constexpr float BATTERY_VOLTAGE_EMPTY = 3.00f;
 // ---------------------------------------------------------------------------
 // Joystick calibration / behaviour
 // ---------------------------------------------------------------------------
-// 12-bit ADC; centre is auto-captured at boot in calibrateJoystick().
+// 12-bit ADC; centre is stored in NVS and can be recalibrated from settings.
 constexpr int   JOY_ADC_MAX        = 4095;
 constexpr int   JOY_DEAD_COUNTS    = 120;   // raw counts around centre treated as zero
 constexpr float JOY_OUTPUT_GAMMA   = 1.0f;  // >1 = softer near centre; 1 = linear
@@ -180,7 +180,7 @@ static void readBatteryVoltage() {
 // Joystick
 // ---------------------------------------------------------------------------
 static void calibrateJoystick() {
-    // Average several samples at boot; assumes the user isn't touching it.
+    // Average several samples; user should release the stick while calibrating.
     long sx = 0, sy = 0;
     constexpr int N = 32;
     for (int i = 0; i < N; i++) {
@@ -190,6 +190,18 @@ static void calibrateJoystick() {
     }
     g_joyCenterX = (int)(sy / N);  // X axis reads from JOY_Y_PIN (swapped for mount orientation)
     g_joyCenterY = (int)(sx / N);  // Y axis reads from JOY_X_PIN
+}
+
+static void saveJoystickCalibration() {
+    preferences.begin("settings", false);
+    preferences.putInt("joyCtrX", g_joyCenterX);
+    preferences.putInt("joyCtrY", g_joyCenterY);
+    preferences.end();
+}
+
+static void calibrateAndSaveJoystick() {
+    calibrateJoystick();
+    saveJoystickCalibration();
 }
 
 static int steeringCenterCounts() {
@@ -204,6 +216,8 @@ static void loadSettings() {
     g_wakeOnClick = preferences.getBool("wakeOnClick", true);
     g_wakeOnMovement = preferences.getBool("wakeOnMove", true);
     g_steeringTrimCounts = preferences.getInt("steerTrim", 0);
+    g_joyCenterX = preferences.getInt("joyCtrX", 2048);
+    g_joyCenterY = preferences.getInt("joyCtrY", 2048);
     preferences.end();
 
     g_steeringTrimCounts = constrain(g_steeringTrimCounts,
@@ -218,6 +232,8 @@ static void saveSettings() {
     preferences.putBool("wakeOnClick", g_wakeOnClick);
     preferences.putBool("wakeOnMove", g_wakeOnMovement);
     preferences.putInt("steerTrim", g_steeringTrimCounts);
+    preferences.putInt("joyCtrX", g_joyCenterX);
+    preferences.putInt("joyCtrY", g_joyCenterY);
     preferences.end();
     g_settingsDirty = false;
 }
@@ -494,23 +510,24 @@ static void drawDisplay(const JoystickReading& joy) {
             display.println(F("Settings"));
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
 
-            display.setCursor(0, 16);
+            display.setCursor(0, 14);
             display.print(g_menuSelectionSettings == 0 ? F("> ") : F("  "));
             display.print(F("Sleep Timeout: "));
             display.print(g_idleSleepEnabled ? F("ON") : F("OFF"));
 
-            display.setCursor(0, 26);
+            display.setCursor(0, 22);
             display.print(g_menuSelectionSettings == 1 ? F("> ") : F("  "));
             display.print(F("Wake on Click: "));
             display.print(g_wakeOnClick ? F("ON") : F("OFF"));
 
-            display.setCursor(0, 36);
+            display.setCursor(0, 30);
             display.print(g_menuSelectionSettings == 2 ? F("> ") : F("  "));
             display.print(F("Wake on Move: "));
             display.print(g_wakeOnMovement ? F("ON") : F("OFF"));
 
-            drawMenuLine(46, g_menuSelectionSettings == 3, "Sleep Now");
-            drawMenuLine(56, g_menuSelectionSettings == 4, "Back");
+            drawMenuLine(38, g_menuSelectionSettings == 3, "Calibrate Stick");
+            drawMenuLine(46, g_menuSelectionSettings == 4, "Sleep Now");
+            drawMenuLine(54, g_menuSelectionSettings == 5, "Back");
             display.display();
             return;
         }
@@ -651,8 +668,8 @@ static void moveMenuSelection(int delta) {
         if (g_menuSelectionRoot > 4) g_menuSelectionRoot = 0;
     } else if (g_menuScreen == MenuScreen::SETTINGS) {
         g_menuSelectionSettings += delta;
-        if (g_menuSelectionSettings < 0) g_menuSelectionSettings = 4;
-        if (g_menuSelectionSettings > 4) g_menuSelectionSettings = 0;
+        if (g_menuSelectionSettings < 0) g_menuSelectionSettings = 5;
+        if (g_menuSelectionSettings > 5) g_menuSelectionSettings = 0;
     } else if (g_menuScreen == MenuScreen::NAVIGATION) {
         g_menuSelectionNav += delta;
         if (g_menuSelectionNav < 0) g_menuSelectionNav = 2;
@@ -698,6 +715,10 @@ static void onMenuClick() {
             g_wakeOnMovement = !g_wakeOnMovement;
             g_settingsDirty = true;
         } else if (g_menuSelectionSettings == 3) {
+            calibrateAndSaveJoystick();
+            Serial.printf("[Settings] joystick centre recalibrated: x=%d y=%d\n",
+                          g_joyCenterX, g_joyCenterY);
+        } else if (g_menuSelectionSettings == 4) {
             if (g_settingsDirty) saveSettings();
             enterDeepSleep();
         } else {
@@ -832,12 +853,10 @@ void setup() {
         display.println(F("Sauna Boat"));
         display.println(F("Handheld Controller"));
         display.println();
-        display.println(F("calibrating stick..."));
+        display.println(F("loading settings..."));
         display.display();
     }
-
-    calibrateJoystick();
-    Serial.printf("[Setup] joystick centre: x=%d y=%d\n",
+    Serial.printf("[Setup] joystick centre (NVS): x=%d y=%d\n",
                   g_joyCenterX, g_joyCenterY);
 
     // ---- WiFi + ESP-NOW ----
