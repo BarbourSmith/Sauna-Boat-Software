@@ -52,7 +52,7 @@
 constexpr float BATTERY_R1            = 27000.0f;
 constexpr float BATTERY_R2            = 68000.0f;
 constexpr float BATTERY_DIVIDER_RATIO = BATTERY_R2 / (BATTERY_R1 + BATTERY_R2);
-constexpr float BATTERY_VOLTAGE_FULL  = 4.20f;
+constexpr float BATTERY_VOLTAGE_FULL  = 4.10f;
 constexpr float BATTERY_VOLTAGE_EMPTY = 3.00f;
 
 // ---------------------------------------------------------------------------
