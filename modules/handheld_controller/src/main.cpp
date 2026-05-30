@@ -768,8 +768,8 @@ static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
                            g_menuScreen == MenuScreen::SETTINGS ||
                            g_menuScreen == MenuScreen::NAVIGATION)) {
         int menuDelta = 0;
-        if (joy.y > 0.6f) menuDelta = -1;
-        else if (joy.y < -0.6f) menuDelta = 1;
+        if (joy.y > 0.6f) menuDelta = 1;
+        else if (joy.y < -0.6f) menuDelta = -1;
 
         if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
             moveMenuSelection(menuDelta);
