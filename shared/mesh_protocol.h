@@ -72,6 +72,24 @@
 //   value2 = target heading in degrees [0, 360) when active, 0 otherwise.
 #define MSG_HEADING_HOLD_STATUS 0x07
 
+// MSG_AP_TUNING – sent by the handheld to update one autopilot PID parameter.
+//   value1 = parameter ID (see AP_PARAM_* constants below).
+//   value2 = new value for that parameter.
+#define MSG_AP_TUNING 0x08
+
+// MSG_AP_TUNING_STATUS – broadcast by the navigation module.
+//   value1 = parameter ID (see AP_PARAM_* constants below).
+//   value2 = current value for that parameter.
+#define MSG_AP_TUNING_STATUS 0x09
+
+// Parameter IDs for MSG_AP_TUNING
+#define AP_PARAM_KP         0
+#define AP_PARAM_KI         1
+#define AP_PARAM_KD         2
+#define AP_PARAM_MAX_OUTPUT 3
+#define AP_PARAM_DEADBAND   4
+#define AP_PARAM_RATE_LIMIT 5
+
 // ---------------------------------------------------------------------------
 // Button bitmask flags used in ControllerInputMessage.buttons
 // ---------------------------------------------------------------------------

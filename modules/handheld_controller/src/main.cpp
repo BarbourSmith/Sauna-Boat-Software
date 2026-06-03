@@ -114,6 +114,8 @@ static uint8_t      g_navSatellites    = 0;
 static unsigned long g_lastNavMs       = 0;
 static bool         g_navHoldActive    = false;
 static float        g_navHoldTarget    = NAN;
+static float        g_navSteerCmd      = NAN;
+static unsigned long g_lastNavSteerMs  = 0;
 
 static float        g_steeringAngle    = NAN;
 static float        g_steeringTarget   = NAN;
@@ -147,15 +149,26 @@ enum class MenuScreen : uint8_t {
     NAVIGATION,
     NAV_INFO,
     STEERING_TRIM,
-    BATTERY
+    BATTERY,
+    AP_TUNING
 };
 
 static MenuScreen g_menuScreen = MenuScreen::NONE;
 static int g_menuSelectionRoot = 0;
 static int g_menuSelectionSettings = 0;
 static int g_menuSelectionNav  = 0;
+static int g_menuSelectionApTuning = 0;
 static bool g_settingsDirty = false;
-static uint8_t g_holdRequestPulses = 0;
+static uint8_t g_holdRequestPulses   = 0;
+static uint8_t g_holdDisengagePulses = 0;
+
+// Local mirror of nav autopilot tuning values (received via MSG_AP_TUNING echo or initialised on connect)
+static float g_apKp        = 0.008f;
+static float g_apKi        = 0.0f;
+static float g_apKd        = 0.2f;
+static float g_apMaxOutput = 1.0f;
+static float g_apDeadband  = 3.0f;
+static float g_apRateLimit = 0.05f;
 
 static bool g_prevButtonPressed = false;
 static unsigned long g_lastMenuMoveMs = 0;
@@ -328,6 +341,55 @@ static void onDataRecv(const uint8_t* /*mac*/,
         g_navHoldTarget = g_navHoldActive ? m.value2 : NAN;
         return;
     }
+
+    if (type == MSG_AP_TUNING_STATUS && len >= (int)sizeof(MeshMessage)) {
+        MeshMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+
+        switch ((uint8_t)m.value1) {
+            case AP_PARAM_KP:
+                g_apKp = m.value2;
+                break;
+            case AP_PARAM_KI:
+                g_apKi = m.value2;
+                break;
+            case AP_PARAM_KD:
+                g_apKd = m.value2;
+                break;
+            case AP_PARAM_MAX_OUTPUT:
+                g_apMaxOutput = m.value2;
+                break;
+            case AP_PARAM_DEADBAND:
+                g_apDeadband = m.value2;
+                break;
+            case AP_PARAM_RATE_LIMIT:
+                g_apRateLimit = m.value2;
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
+    if (type == MSG_SET_STEERING && len >= (int)sizeof(MeshMessage)) {
+        MeshMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        g_navSteerCmd = constrain(m.value1, -1.0f, 1.0f);
+        g_lastNavSteerMs = millis();
+        return;
+    }
+}
+
+static void sendApTuning(uint8_t paramId, float value) {
+    MeshMessage msg;
+    msg.type   = MSG_AP_TUNING;
+    msg.src    = MODULE_HANDHELD;
+    msg.value1 = (float)paramId;
+    msg.value2 = value;
+    esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    Serial.printf("[APTune] param=%u val=%.4f\n", paramId, value);
 }
 
 static void sendControllerInput(const JoystickReading& joy, uint16_t extraButtons = 0) {
@@ -508,10 +570,10 @@ static void drawDisplay(const JoystickReading& joy) {
             display.println(F("Menu"));
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
             drawMenuLine(14, g_menuSelectionRoot == 0, "Navigation");
-            drawMenuLine(24, g_menuSelectionRoot == 1, "Settings");
-            drawMenuLine(34, g_menuSelectionRoot == 2, "Steering Trim");
-            drawMenuLine(44, g_menuSelectionRoot == 3, "Battery");
-            drawMenuLine(54, g_menuSelectionRoot == 4, "Close");
+            drawMenuLine(22, g_menuSelectionRoot == 1, "Settings");
+            drawMenuLine(30, g_menuSelectionRoot == 2, "Steering Trim");
+            drawMenuLine(38, g_menuSelectionRoot == 3, "Battery");
+            drawMenuLine(46, g_menuSelectionRoot == 4, "Close");
             display.display();
             return;
         }
@@ -547,14 +609,14 @@ static void drawDisplay(const JoystickReading& joy) {
             display.setCursor(0, 0);
             display.println(F("Navigation"));
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
-            drawMenuLine(16, g_menuSelectionNav == 0, "Info");
-            display.setCursor(0, 28);
-            display.print(g_menuSelectionNav == 1 ? F("> ") : F("  "));
-            display.print(F("Heading Hold: "));
+            drawMenuLine(16, g_menuSelectionNav == 0, "Heading Hold");
+            drawMenuLine(28, g_menuSelectionNav == 1, "AP Tuning");
+            display.setCursor(0, 40);
+            display.print(g_menuSelectionNav == 2 ? F("> ") : F("  "));
+            display.print(F("Info"));
+            display.setCursor(96, 16);
             display.print(g_navHoldActive ? F("ON") : F("OFF"));
-            drawMenuLine(40, g_menuSelectionNav == 2, "Back");
-            display.setCursor(0, 54);
-            display.println(F("Click to select"));
+            drawMenuLine(52, g_menuSelectionNav == 3, "Back");
             display.display();
             return;
         }
@@ -613,6 +675,29 @@ static void drawDisplay(const JoystickReading& joy) {
             display.display();
             return;
         }
+
+        if (g_menuScreen == MenuScreen::AP_TUNING) {
+            // 6 params: Kp Ki Kd Max Dead Rate
+            static const char* const paramNames[] = { "Kp", "Ki", "Kd", "Max", "Dead", "Rate" };
+            const float paramValues[] = { g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit };
+            int startIndex = g_menuSelectionApTuning - 2;
+            if (startIndex < 0) startIndex = 0;
+            if (startIndex > 1) startIndex = 1;
+            display.setCursor(0, 0);
+            display.println(F("AP Tuning"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            for (int row = 0; row < 5; ++row) {
+                int i = startIndex + row;
+                int y = 14 + row * 9;
+                display.setCursor(0, y);
+                display.print(g_menuSelectionApTuning == i ? F("> ") : F("  "));
+                display.printf("%-4s %6.4f", paramNames[i], paramValues[i]);
+            }
+            display.setCursor(0, 56);
+            display.print(F("L/R adj  click back"));
+            display.display();
+            return;
+        }
     }
 
     // Top: battery + receive-link heartbeat.
@@ -630,23 +715,18 @@ static void drawDisplay(const JoystickReading& joy) {
     else                      display.print(F("HDG  ---"));
 
     display.setCursor(0, 26);
+    if (g_lastNavSteerMs != 0 && (millis() - g_lastNavSteerMs) < 2000 && !isnan(g_navSteerCmd)) {
+        display.printf("NAV CMD %+.3f", g_navSteerCmd);
+    } else {
+        display.print(F("NAV CMD ---"));
+    }
+
+    display.setCursor(0, 38);
     if (g_navHoldActive && !isnan(g_navHoldTarget)) {
         display.printf("HOLD %5.1f", g_navHoldTarget);
     } else {
         display.print(F("HOLD ---"));
     }
-
-    display.setCursor(0, 38);
-    if (g_lastSendMs != 0) {
-        unsigned long txAgeMs = millis() - g_lastSendMs;
-        display.printf("TX %s %4lums", g_lastSendOk ? "OK" : "FL", txAgeMs);
-    } else {
-        display.print(F("TX --"));
-    }
-    display.setCursor(72, 38);
-    display.printf("%lu/%lu",
-                   (unsigned long)g_sendOkCount,
-                   (unsigned long)g_sendFailCount);
 
     // Joystick visualisation: keep icon box, hide XY text.
     if (joy.button) {
@@ -679,8 +759,12 @@ static void moveMenuSelection(int delta) {
         if (g_menuSelectionSettings > 5) g_menuSelectionSettings = 0;
     } else if (g_menuScreen == MenuScreen::NAVIGATION) {
         g_menuSelectionNav += delta;
-        if (g_menuSelectionNav < 0) g_menuSelectionNav = 2;
-        if (g_menuSelectionNav > 2) g_menuSelectionNav = 0;
+        if (g_menuSelectionNav < 0) g_menuSelectionNav = 3;
+        if (g_menuSelectionNav > 3) g_menuSelectionNav = 0;
+    } else if (g_menuScreen == MenuScreen::AP_TUNING) {
+        g_menuSelectionApTuning += delta;
+        if (g_menuSelectionApTuning < 0) g_menuSelectionApTuning = 5;
+        if (g_menuSelectionApTuning > 5) g_menuSelectionApTuning = 0;
     }
 }
 
@@ -737,10 +821,18 @@ static void onMenuClick() {
 
     if (g_menuScreen == MenuScreen::NAVIGATION) {
         if (g_menuSelectionNav == 0) {
-            g_menuScreen = MenuScreen::NAV_INFO;
+            if (g_navHoldActive) {
+                // Disengage: send D-pad DOWN pulse.
+                g_holdDisengagePulses = 2;
+            } else {
+                // Engage: send D-pad UP pulse.
+                g_holdRequestPulses = 2;
+            }
+            g_menuScreen = MenuScreen::NONE;
         } else if (g_menuSelectionNav == 1) {
-            // Request heading hold engage/re-capture via D-pad UP pulse.
-            g_holdRequestPulses = 2;
+            g_menuScreen = MenuScreen::AP_TUNING;
+        } else if (g_menuSelectionNav == 2) {
+            g_menuScreen = MenuScreen::NAV_INFO;
         } else {
             g_menuScreen = MenuScreen::ROOT;
         }
@@ -760,6 +852,12 @@ static void onMenuClick() {
 
     if (g_menuScreen == MenuScreen::BATTERY) {
         g_menuScreen = MenuScreen::ROOT;
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::AP_TUNING) {
+        g_menuScreen = MenuScreen::NAVIGATION;
+        return;
     }
 }
 
@@ -790,6 +888,31 @@ static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
 
         if (trimDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
             adjustSteeringTrim(trimDelta);
+            g_lastMenuMoveMs = now;
+        }
+    } else if (g_menuScreen == MenuScreen::AP_TUNING) {
+        // Y scrolls between parameters.
+        int menuDelta = 0;
+        if (joy.y > 0.6f) menuDelta = 1;
+        else if (joy.y < -0.6f) menuDelta = -1;
+        if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            moveMenuSelection(menuDelta);
+            g_lastMenuMoveMs = now;
+        }
+        // X adjusts the selected parameter's value.
+        float jx = joy.x;
+        if (fabsf(jx) > 0.6f && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            float sign = (jx > 0) ? 1.0f : -1.0f;
+            static const float steps[] = { 0.001f, 0.001f, 0.01f, 0.05f, 0.5f, 0.005f };
+            float step = sign * steps[g_menuSelectionApTuning];
+            switch (g_menuSelectionApTuning) {
+                case AP_PARAM_KP:         g_apKp        = constrain(g_apKp        + step, 0.0f,   1.0f);  sendApTuning(AP_PARAM_KP,         g_apKp);        break;
+                case AP_PARAM_KI:         g_apKi        = constrain(g_apKi        + step, 0.0f,   1.0f);  sendApTuning(AP_PARAM_KI,         g_apKi);        break;
+                case AP_PARAM_KD:         g_apKd        = constrain(g_apKd        + step, 0.0f,   5.0f);  sendApTuning(AP_PARAM_KD,         g_apKd);        break;
+                case AP_PARAM_MAX_OUTPUT: g_apMaxOutput = constrain(g_apMaxOutput + step, 0.05f,  1.0f);  sendApTuning(AP_PARAM_MAX_OUTPUT, g_apMaxOutput); break;
+                case AP_PARAM_DEADBAND:   g_apDeadband  = constrain(g_apDeadband  + step, 0.0f,  30.0f);  sendApTuning(AP_PARAM_DEADBAND,   g_apDeadband);  break;
+                case AP_PARAM_RATE_LIMIT: g_apRateLimit = constrain(g_apRateLimit + step, 0.001f, 1.0f);  sendApTuning(AP_PARAM_RATE_LIMIT, g_apRateLimit); break;
+            }
             g_lastMenuMoveMs = now;
         }
     }
@@ -922,6 +1045,10 @@ void loop() {
         if (g_holdRequestPulses > 0) {
             extraButtons |= CTRL_BTN_UP;
             --g_holdRequestPulses;
+        }
+        if (g_holdDisengagePulses > 0) {
+            extraButtons |= CTRL_BTN_DOWN;
+            --g_holdDisengagePulses;
         }
 
         if (isMenuActive()) {

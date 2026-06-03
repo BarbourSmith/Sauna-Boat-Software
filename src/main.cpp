@@ -56,10 +56,12 @@ static String g_settingsBody;
 // steering command immediately takes over so the user can override heading hold.
 static constexpr unsigned long NAV_PRIORITY_MS = 600;  // suppress handheld for this long after a nav command
 static unsigned long g_lastNavCmdTime = 0;             // timestamp of last nav module command
-static constexpr float HANDHELD_STRAIGHT_DEADZONE = 10.0f / 127.0f;
+static constexpr float HANDHELD_OVERRIDE_ENTER = 0.20f;
+static constexpr float HANDHELD_OVERRIDE_EXIT = 0.10f;
 static constexpr unsigned long HANDHELD_INPUT_TIMEOUT_MS = 300;
 static float g_lastHandheldLx = 0.0f;
 static unsigned long g_lastHandheldInputMs = 0;
+static bool g_handheldOverrideActive = false;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
@@ -95,12 +97,19 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         } else if (msg.src == MODULE_HANDHELD) {
             bool handheldInputFresh =
                 (now - g_lastHandheldInputMs) <= HANDHELD_INPUT_TIMEOUT_MS;
-            bool handheldActive = handheldInputFresh &&
-                (g_lastHandheldLx <= -HANDHELD_STRAIGHT_DEADZONE ||
-                 g_lastHandheldLx >= HANDHELD_STRAIGHT_DEADZONE);
+            float absLx = fabsf(g_lastHandheldLx);
+            if (handheldInputFresh) {
+                if (g_handheldOverrideActive) {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_EXIT;
+                } else {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_ENTER;
+                }
+            } else {
+                g_handheldOverrideActive = false;
+            }
 
             // While nav is active, only suppress handheld when the stick is straight/idle.
-            if ((now - g_lastNavCmdTime) < NAV_PRIORITY_MS && !handheldActive) {
+            if ((now - g_lastNavCmdTime) < NAV_PRIORITY_MS && !g_handheldOverrideActive) {
                 return;  // ignore idle handheld input — nav keeps priority
             }
         }

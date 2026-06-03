@@ -56,6 +56,8 @@ static bool           g_trimDirty         = false;
 // Dead-zone applied to raw left-stick X from MSG_CONTROLLER_INPUT.
 // Sticks naturally drift; anything within this band is treated as centred.
 static constexpr float STICK_DEADZONE = 10.0f / 127.0f;  // ~8% of full range
+static constexpr float HANDHELD_OVERRIDE_ENTER = 0.20f;
+static constexpr float HANDHELD_OVERRIDE_EXIT = 0.10f;
 
 // Trim step applied each 50 ms frame while the D-pad button is held.
 // 0.01 ≈ 10 µs of servo pulse width; at 20 Hz this gives ~0.2 normalised/sec.
@@ -77,6 +79,7 @@ static bool           g_headingHoldActive = false;
 static unsigned long  g_lastHeadingHoldStatusMs = 0;
 static float          g_lastHandheldLx = 0.0f;
 static unsigned long  g_lastHandheldInputMs = 0;
+static bool           g_handheldOverrideActive = false;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
@@ -102,11 +105,23 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
             g_lastHandheldInputMs = millis();
         }
 
-        // In heading hold: straight/idle handheld input yields to navigation,
-        // but any non-straight handheld steering input takes immediate control.
+        // In heading hold: only meaningful handheld stick deflection should override.
         float lx = msg.lx;
-        bool handheldStraight = (lx > -STICK_DEADZONE && lx < STICK_DEADZONE);
-        if (holdActive && handheldStraight) return;
+        if (holdActive) {
+            bool handheldInputFresh =
+                (millis() - g_lastHandheldInputMs) <= HANDHELD_INPUT_TIMEOUT_MS;
+            float absLx = fabsf(g_lastHandheldLx);
+            if (handheldInputFresh) {
+                if (g_handheldOverrideActive) {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_EXIT;
+                } else {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_ENTER;
+                }
+            } else {
+                g_handheldOverrideActive = false;
+            }
+            if (!g_handheldOverrideActive) return;
+        }
 
         // D-pad left/right: adjust trim while the button is held (level-triggered).
         // Each 50 ms frame the button is held nudges the servo centre by TRIM_STEP.
@@ -148,9 +163,17 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         if (holdActive && msg.src == MODULE_HANDHELD) {
             bool handheldInputFresh =
                 (millis() - g_lastHandheldInputMs) <= HANDHELD_INPUT_TIMEOUT_MS;
-            bool handheldActive = handheldInputFresh &&
-                (g_lastHandheldLx <= -STICK_DEADZONE || g_lastHandheldLx >= STICK_DEADZONE);
-            if (!handheldActive) return;
+            float absLx = fabsf(g_lastHandheldLx);
+            if (handheldInputFresh) {
+                if (g_handheldOverrideActive) {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_EXIT;
+                } else {
+                    g_handheldOverrideActive = absLx >= HANDHELD_OVERRIDE_ENTER;
+                }
+            } else {
+                g_handheldOverrideActive = false;
+            }
+            if (!g_handheldOverrideActive) return;
         } else if (holdActive && msg.src != MODULE_NAVIGATION) {
             return;
         }

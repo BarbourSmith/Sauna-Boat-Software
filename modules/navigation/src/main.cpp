@@ -46,7 +46,10 @@ static constexpr unsigned long CAL_PROGRESS_MS   = 1000;  // calibration progres
 static constexpr unsigned long AUTOPILOT_MS      = 200;   // 5 Hz autopilot compute rate
 static constexpr unsigned long AP_SEND_MS        = 50;    // 20 Hz send rate — must be well under the steering watchdog (200 ms)
 static constexpr unsigned long WS_BROADCAST_MS   = 200;   // 5 Hz WebSocket status broadcast
-static constexpr float         STICK_DEADZONE    = 0.15f; // joystick magnitude to trigger manual override
+static constexpr float         STICK_OVERRIDE_ENTER = 0.20f; // enter manual-yield above this magnitude
+static constexpr float         STICK_OVERRIDE_EXIT  = 0.10f; // remain in manual-yield until below this magnitude
+static constexpr unsigned long CTRL_INPUT_TIMEOUT_MS = 1000; // controller input considered stale after this
+static constexpr unsigned long HOLD_RESUME_DELAY_MS = 300; // stick must remain centered this long before hold resumes
 
 // ---------------------------------------------------------------------------
 // Heading-hold autopilot tuning (PD controller) — loaded from NVS
@@ -54,7 +57,7 @@ static constexpr float         STICK_DEADZONE    = 0.15f; // joystick magnitude 
 static float g_apKp         = 0.008f;  // proportional gain
 static float g_apKi         = 0.003f;  // integral gain
 static float g_apKd         = 0.12f;   // derivative gain
-static float g_apMaxOutput  = 0.5f;    // max steering command magnitude [0, 1]
+static float g_apMaxOutput  = 1.0f;    // max steering command magnitude [0, 1]
 static float g_apDeadband   = 3.0f;    // ignore errors smaller than this (degrees)
 static float g_apRateLimit  = 0.05f;   // max change in output per autopilot tick
 
@@ -93,6 +96,8 @@ static float g_calMinZ, g_calMaxZ;
 
 // Heading hold state
 static bool          g_headingHoldActive = false;
+static bool          g_headingHoldYielding = false;
+static unsigned long g_lastManualOverrideMs = 0;
 static float         g_targetHeading     = 0.0f;
 static float         g_apOutput          = 0.0f;
 static float         g_prevError         = 0.0f;
@@ -104,6 +109,7 @@ static float    g_stickLX    = 0.0f;
 static uint16_t g_ctrlBtns   = 0;
 static uint16_t g_prevBtns   = 0;
 static bool     g_ctrlOnline = false;
+static unsigned long g_lastCtrlInputMs = 0;
 
 // ESP-NOW diagnostics
 static uint32_t g_sendCount     = 0;
@@ -117,9 +123,16 @@ static void loadTuningFromNVS() {
     g_apKp        = prefs.getFloat("apKp",       0.008f);
     g_apKi        = prefs.getFloat("apKi",       0.0f);
     g_apKd        = prefs.getFloat("apKd",       0.2f);
-    g_apMaxOutput = prefs.getFloat("apMax",      0.35f);
+    g_apMaxOutput = prefs.getFloat("apMax",      1.0f);
     g_apDeadband  = prefs.getFloat("apDead",     3.0f);
     g_apRateLimit = prefs.getFloat("apRate",     0.05f);
+
+    // Use full steering authority by default for heading hold.
+    if (g_apMaxOutput < 1.0f) {
+        g_apMaxOutput = 1.0f;
+        prefs.putFloat("apMax", g_apMaxOutput);
+    }
+
     Serial.printf("[Setup] Autopilot tuning: Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f\n",
                   g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
 }
@@ -309,7 +322,7 @@ static void sendSteeringSpeed(float speed) {
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
 }
 
-static void onDataSent(const uint8_t* /*mac*/, esp_now_send_status_t status) {
+static void onDataSent(const wifi_tx_info_t* /*tx_info*/, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         ++g_sendOkCount;
     } else {
@@ -356,6 +369,35 @@ static void broadcastHeadingHoldStatus() {
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
 }
 
+static void broadcastApTuningStatus() {
+    const uint8_t paramIds[] = {
+        AP_PARAM_KP,
+        AP_PARAM_KI,
+        AP_PARAM_KD,
+        AP_PARAM_MAX_OUTPUT,
+        AP_PARAM_DEADBAND,
+        AP_PARAM_RATE_LIMIT,
+    };
+    const float values[] = {
+        g_apKp,
+        g_apKi,
+        g_apKd,
+        g_apMaxOutput,
+        g_apDeadband,
+        g_apRateLimit,
+    };
+
+    for (size_t i = 0; i < (sizeof(paramIds) / sizeof(paramIds[0])); ++i) {
+        MeshMessage msg;
+        msg.type   = MSG_AP_TUNING_STATUS;
+        msg.src    = MODULE_NAVIGATION;
+        msg.value1 = (float)paramIds[i];
+        msg.value2 = values[i];
+        esp_now_send(MESH_BROADCAST_ADDR,
+                     reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback
 // ---------------------------------------------------------------------------
@@ -370,6 +412,31 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         g_stickLX    = ci.lx;
         g_ctrlBtns   = ci.buttons;
         g_ctrlOnline = true;
+        g_lastCtrlInputMs = millis();
+        return;
+    }
+
+    if (type == MSG_AP_TUNING && len >= static_cast<int>(sizeof(MeshMessage))) {
+        MeshMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_HANDHELD) return;
+        uint8_t paramId = (uint8_t)m.value1;
+        float   value   = m.value2;
+        switch (paramId) {
+            case AP_PARAM_KP:         g_apKp        = constrain(value,  0.0f,  1.0f); break;
+            case AP_PARAM_KI:         g_apKi        = constrain(value,  0.0f,  1.0f); break;
+            case AP_PARAM_KD:         g_apKd        = constrain(value,  0.0f,  5.0f); break;
+            case AP_PARAM_MAX_OUTPUT: g_apMaxOutput = constrain(value,  0.05f, 1.0f); break;
+            case AP_PARAM_DEADBAND:   g_apDeadband  = constrain(value,  0.0f, 30.0f); break;
+            case AP_PARAM_RATE_LIMIT: g_apRateLimit = constrain(value,  0.001f,1.0f); break;
+            default: return;
+        }
+        g_integral = 0.0f;  // reset integral when tuning changes
+        saveTuningToNVS();
+        broadcastApTuningStatus();
+        Serial.printf("[APTune] param=%u val=%.4f (Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f)\n",
+                      paramId, value, g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
+        return;
     }
 }
 
@@ -600,27 +667,64 @@ void loop() {
 
     // --- Controller input → heading hold ---
     if (g_ctrlOnline) {
-        bool upNow  = (g_ctrlBtns & CTRL_BTN_UP) != 0;
-        bool upPrev = (g_prevBtns & CTRL_BTN_UP) != 0;
+        bool upNow   = (g_ctrlBtns & CTRL_BTN_UP)   != 0;
+        bool upPrev  = (g_prevBtns & CTRL_BTN_UP)   != 0;
+        bool dnNow   = (g_ctrlBtns & CTRL_BTN_DOWN) != 0;
+        bool dnPrev  = (g_prevBtns & CTRL_BTN_DOWN) != 0;
         if (upNow && !upPrev && g_bmm150Ok) {
             engageHeadingHold();
         }
-        g_prevBtns = g_ctrlBtns;
-
-        if (fabsf(g_stickLX) > STICK_DEADZONE) {
+        if (dnNow && !dnPrev && g_headingHoldActive) {
             disengageHeadingHold();
         }
+        g_prevBtns = g_ctrlBtns;
+    }
 
-        if (g_headingHoldActive) {
-            if (now - lastAutopilot >= AUTOPILOT_MS) {
-                lastAutopilot = now;
-                autopilotUpdate();
+    if (g_headingHoldActive) {
+            bool ctrlFresh = g_ctrlOnline && ((now - g_lastCtrlInputMs) <= CTRL_INPUT_TIMEOUT_MS);
+            float absStick = fabsf(g_stickLX);
+            bool manualOverride = false;
+            if (ctrlFresh) {
+                manualOverride = g_headingHoldYielding
+                    ? (absStick > STICK_OVERRIDE_EXIT)
+                    : (absStick > STICK_OVERRIDE_ENTER);
             }
-            if (now - lastApSend >= AP_SEND_MS) {
-                lastApSend = now;
-                sendSteeringSpeed(g_apOutput);
+
+            if (manualOverride) {
+                if (!g_headingHoldYielding) {
+                    Serial.println("[AP] HOLD YIELDING to manual stick input.");
+                }
+                g_headingHoldYielding = true;
+                g_lastManualOverrideMs = now;
+                // Freeze AP output while yielding so resume is smooth.
+                g_apOutput = 0.0f;
+                g_integral = 0.0f;
+                g_prevError = 0.0f;
+                g_prevErrorTime = now;
+            } else {
+                bool centeredLongEnough =
+                    (now - g_lastManualOverrideMs) >= HOLD_RESUME_DELAY_MS;
+
+                if (g_headingHoldYielding && !centeredLongEnough) {
+                    // Keep yielding until centered state is stable.
+                } else {
+                if (g_headingHoldYielding) {
+                    Serial.println("[AP] HOLD RESUMED.");
+                }
+                g_headingHoldYielding = false;
+
+                if (now - lastAutopilot >= AUTOPILOT_MS) {
+                    lastAutopilot = now;
+                    autopilotUpdate();
+                }
+                if (now - lastApSend >= AP_SEND_MS) {
+                    lastApSend = now;
+                    sendSteeringSpeed(-g_apOutput);
+                }
+                }
             }
-        }
+    } else {
+        g_headingHoldYielding = false;
     }
 
     // Calibration progress / completion.
@@ -645,6 +749,7 @@ void loop() {
         lastBroadcast = now;
         broadcastNavStatus();
         broadcastHeadingHoldStatus();
+        broadcastApTuningStatus();
     }
 
     // Broadcast status to WebSocket clients.
@@ -672,7 +777,8 @@ void loop() {
 
         if (g_headingHoldActive) {
             float err = headingError(g_heading, g_targetHeading);
-            Serial.printf("[AP] HOLD %.1f°  hdg=%.1f°  err=%+.1f°  steer=%+.3f\n",
+            Serial.printf("[AP] %s %.1f°  hdg=%.1f°  err=%+.1f°  steer=%+.3f\n",
+                          g_headingHoldYielding ? "YIELD" : "HOLD",
                           g_targetHeading, g_heading, err, g_apOutput);
         } else {
             Serial.printf("[AP] MANUAL  hdg=%.1f° [%s]  stick=%.2f\n",
