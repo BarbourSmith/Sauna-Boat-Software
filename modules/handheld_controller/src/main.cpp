@@ -916,7 +916,8 @@ void loop() {
             neutralJoy.y = 0.0f;
             neutralJoy.button = false;
             sendControllerInput(neutralJoy);
-            sendSteering(0.0f);
+            // Keep steering responsive while a menu is open.
+            sendSteering(joy.x);
         } else {
             sendControllerInput(joy);
             sendSteering(joy.x);

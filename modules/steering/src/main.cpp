@@ -65,8 +65,15 @@ static constexpr float TRIM_STEP = 0.01f;
 // Prevents flash wear when the button is held for many frames.
 static constexpr unsigned long TRIM_SAVE_DEBOUNCE_MS = 500;
 
+// If heading-hold status goes stale, fall back to manual control.
+static constexpr unsigned long HEADING_HOLD_STATUS_TIMEOUT_MS = 1500;
+
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
+
+// Navigation module heading-hold state broadcast over MSG_HEADING_HOLD_STATUS.
+static bool           g_headingHoldActive = false;
+static unsigned long  g_lastHeadingHoldStatusMs = 0;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
@@ -76,10 +83,19 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
     if (len < 1) return;
     uint8_t type = data[0];
 
+    bool holdActive = g_headingHoldActive;
+    if (holdActive && (millis() - g_lastHeadingHoldStatusMs > HEADING_HOLD_STATUS_TIMEOUT_MS)) {
+        holdActive = false;
+        g_headingHoldActive = false;
+    }
+
     if (type == MSG_CONTROLLER_INPUT) {
         if (len < static_cast<int>(sizeof(ControllerInputMessage))) return;
         ControllerInputMessage msg;
         memcpy(&msg, data, sizeof(msg));
+
+        // Ignore manual controller steering while heading hold is active.
+        if (holdActive) return;
 
         // D-pad left/right: adjust trim while the button is held (level-triggered).
         // Each 50 ms frame the button is held nudges the servo centre by TRIM_STEP.
@@ -117,9 +133,22 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         if (len < static_cast<int>(sizeof(MeshMessage))) return;
         MeshMessage msg;
         memcpy(&msg, data, sizeof(msg));
+
+        // While heading hold is active, only accept steering commands from navigation.
+        if (holdActive && msg.src != MODULE_NAVIGATION) return;
+
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);
         g_currentSpeed = speed;
+
+    } else if (type == MSG_HEADING_HOLD_STATUS) {
+        if (len < static_cast<int>(sizeof(MeshMessage))) return;
+        MeshMessage msg;
+        memcpy(&msg, data, sizeof(msg));
+        if (msg.src != MODULE_NAVIGATION) return;
+
+        g_headingHoldActive = (msg.value1 > 0.5f);
+        g_lastHeadingHoldStatusMs = millis();
     }
 }
 
@@ -292,6 +321,18 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    static bool lastHoldState = false;
+
+    if (g_headingHoldActive &&
+        (millis() - g_lastHeadingHoldStatusMs > HEADING_HOLD_STATUS_TIMEOUT_MS)) {
+        g_headingHoldActive = false;
+    }
+
+    if (g_headingHoldActive != lastHoldState) {
+        Serial.printf("[Hold] %s\n", g_headingHoldActive ? "ACTIVE" : "INACTIVE");
+        lastHoldState = g_headingHoldActive;
+    }
+
     // Trim NVS save: write to flash once the D-pad has been released for
     // TRIM_SAVE_DEBOUNCE_MS, avoiding repeated writes while the button is held.
     if (g_trimDirty && (millis() - g_trimLastChange) >= TRIM_SAVE_DEBOUNCE_MS) {
