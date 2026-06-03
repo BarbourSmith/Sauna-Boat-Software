@@ -67,6 +67,7 @@ static constexpr unsigned long TRIM_SAVE_DEBOUNCE_MS = 500;
 
 // If heading-hold status goes stale, fall back to manual control.
 static constexpr unsigned long HEADING_HOLD_STATUS_TIMEOUT_MS = 1500;
+static constexpr unsigned long HANDHELD_INPUT_TIMEOUT_MS = 300;
 
 // Accumulation buffer for POST /settings request body
 static String g_settingsBody;
@@ -74,6 +75,8 @@ static String g_settingsBody;
 // Navigation module heading-hold state broadcast over MSG_HEADING_HOLD_STATUS.
 static bool           g_headingHoldActive = false;
 static unsigned long  g_lastHeadingHoldStatusMs = 0;
+static float          g_lastHandheldLx = 0.0f;
+static unsigned long  g_lastHandheldInputMs = 0;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
@@ -94,8 +97,16 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         ControllerInputMessage msg;
         memcpy(&msg, data, sizeof(msg));
 
-        // Ignore manual controller steering while heading hold is active.
-        if (holdActive) return;
+        if (msg.src == MODULE_HANDHELD) {
+            g_lastHandheldLx = msg.lx;
+            g_lastHandheldInputMs = millis();
+        }
+
+        // In heading hold: straight/idle handheld input yields to navigation,
+        // but any non-straight handheld steering input takes immediate control.
+        float lx = msg.lx;
+        bool handheldStraight = (lx > -STICK_DEADZONE && lx < STICK_DEADZONE);
+        if (holdActive && handheldStraight) return;
 
         // D-pad left/right: adjust trim while the button is held (level-triggered).
         // Each 50 ms frame the button is held nudges the servo centre by TRIM_STEP.
@@ -121,7 +132,6 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         g_prevButtons = btns;
 
         // Apply dead-zone to left stick X and command the steering speed.
-        float lx = msg.lx;
         if (lx > -STICK_DEADZONE && lx < STICK_DEADZONE) lx = 0.0f;
         float speed = constrain(lx, -1.0f, 1.0f);
 
@@ -134,8 +144,16 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         MeshMessage msg;
         memcpy(&msg, data, sizeof(msg));
 
-        // While heading hold is active, only accept steering commands from navigation.
-        if (holdActive && msg.src != MODULE_NAVIGATION) return;
+        // In heading hold: let handheld override only when it sends non-straight steering.
+        if (holdActive && msg.src == MODULE_HANDHELD) {
+            bool handheldInputFresh =
+                (millis() - g_lastHandheldInputMs) <= HANDHELD_INPUT_TIMEOUT_MS;
+            bool handheldActive = handheldInputFresh &&
+                (g_lastHandheldLx <= -STICK_DEADZONE || g_lastHandheldLx >= STICK_DEADZONE);
+            if (!handheldActive) return;
+        } else if (holdActive && msg.src != MODULE_NAVIGATION) {
+            return;
+        }
 
         float speed = constrain(msg.value1, -1.0f, 1.0f);
         steeringMotor.setSpeed(speed);

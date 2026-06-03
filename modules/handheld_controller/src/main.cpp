@@ -112,6 +112,8 @@ static float        g_navSpeedKnots    = NAN;
 static uint8_t      g_navFixType       = 0;
 static uint8_t      g_navSatellites    = 0;
 static unsigned long g_lastNavMs       = 0;
+static bool         g_navHoldActive    = false;
+static float        g_navHoldTarget    = NAN;
 
 static float        g_steeringAngle    = NAN;
 static float        g_steeringTarget   = NAN;
@@ -152,8 +154,8 @@ static MenuScreen g_menuScreen = MenuScreen::NONE;
 static int g_menuSelectionRoot = 0;
 static int g_menuSelectionSettings = 0;
 static int g_menuSelectionNav  = 0;
-static bool g_headingHoldEnabled = false;
 static bool g_settingsDirty = false;
+static uint8_t g_holdRequestPulses = 0;
 
 static bool g_prevButtonPressed = false;
 static unsigned long g_lastMenuMoveMs = 0;
@@ -317,9 +319,18 @@ static void onDataRecv(const uint8_t* /*mac*/,
         g_lastSteeringMs = millis();
         return;
     }
+
+    if (type == MSG_HEADING_HOLD_STATUS && len >= (int)sizeof(MeshMessage)) {
+        MeshMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        g_navHoldActive = (m.value1 > 0.5f);
+        g_navHoldTarget = g_navHoldActive ? m.value2 : NAN;
+        return;
+    }
 }
 
-static void sendControllerInput(const JoystickReading& joy) {
+static void sendControllerInput(const JoystickReading& joy, uint16_t extraButtons = 0) {
     ControllerInputMessage msg = {};
     msg.type    = MSG_CONTROLLER_INPUT;
     msg.src     = MODULE_HANDHELD;
@@ -327,7 +338,7 @@ static void sendControllerInput(const JoystickReading& joy) {
     msg.ly      = joy.y;
     msg.rx      = 0.0f;
     msg.ry      = 0.0f;
-    msg.buttons = joy.button ? CTRL_BTN_L3 : 0;  // joystick click → L3
+    msg.buttons = (joy.button ? CTRL_BTN_L3 : 0) | extraButtons;  // joystick click → L3
     esp_now_send(MESH_BROADCAST_ADDR,
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
 }
@@ -540,7 +551,7 @@ static void drawDisplay(const JoystickReading& joy) {
             display.setCursor(0, 28);
             display.print(g_menuSelectionNav == 1 ? F("> ") : F("  "));
             display.print(F("Heading Hold: "));
-            display.print(g_headingHoldEnabled ? F("ON") : F("OFF"));
+            display.print(g_navHoldActive ? F("ON") : F("OFF"));
             drawMenuLine(40, g_menuSelectionNav == 2, "Back");
             display.setCursor(0, 54);
             display.println(F("Click to select"));
@@ -613,37 +624,33 @@ static void drawDisplay(const JoystickReading& joy) {
 
     display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
 
-    // Wi-Fi / ESP-NOW diagnostics (replaces heading/satellite fields).
+    // Heading status.
     display.setCursor(0, 14);
-    display.printf("WiFi ch%u", (unsigned int)MESH_WIFI_CHANNEL);
-    display.setCursor(72, 14);
-    display.printf("Fix %u", g_navFixType);
+    if (!isnan(g_navHeading)) display.printf("HDG %5.1f", g_navHeading);
+    else                      display.print(F("HDG  ---"));
 
     display.setCursor(0, 26);
+    if (g_navHoldActive && !isnan(g_navHoldTarget)) {
+        display.printf("HOLD %5.1f", g_navHoldTarget);
+    } else {
+        display.print(F("HOLD ---"));
+    }
+
+    display.setCursor(0, 38);
     if (g_lastSendMs != 0) {
         unsigned long txAgeMs = millis() - g_lastSendMs;
         display.printf("TX %s %4lums", g_lastSendOk ? "OK" : "FL", txAgeMs);
     } else {
         display.print(F("TX --"));
     }
-    display.setCursor(72, 26);
+    display.setCursor(72, 38);
     display.printf("%lu/%lu",
                    (unsigned long)g_sendOkCount,
                    (unsigned long)g_sendFailCount);
 
-    // Steering target / actual from boat feedback.
-    display.setCursor(0, 38);
-    if (!isnan(g_steeringAngle)) {
-        display.printf("RUD %5.1f -> %5.1f", g_steeringAngle, g_steeringTarget);
-    } else {
-        display.print(F("RUD  ---"));
-    }
-
-    // Joystick visualisation: small box bottom-right, value bottom-left.
-    display.setCursor(0, 52);
-    display.printf("X%+.2f Y%+.2f", joy.x, joy.y);
+    // Joystick visualisation: keep icon box, hide XY text.
     if (joy.button) {
-        display.setCursor(78, 52);
+        display.setCursor(0, 52);
         display.print(F("[BTN]"));
     }
 
@@ -732,7 +739,8 @@ static void onMenuClick() {
         if (g_menuSelectionNav == 0) {
             g_menuScreen = MenuScreen::NAV_INFO;
         } else if (g_menuSelectionNav == 1) {
-            g_headingHoldEnabled = !g_headingHoldEnabled;
+            // Request heading hold engage/re-capture via D-pad UP pulse.
+            g_holdRequestPulses = 2;
         } else {
             g_menuScreen = MenuScreen::ROOT;
         }
@@ -910,16 +918,22 @@ void loop() {
 
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
+        uint16_t extraButtons = 0;
+        if (g_holdRequestPulses > 0) {
+            extraButtons |= CTRL_BTN_UP;
+            --g_holdRequestPulses;
+        }
+
         if (isMenuActive()) {
             JoystickReading neutralJoy = joy;
             neutralJoy.x = 0.0f;
             neutralJoy.y = 0.0f;
             neutralJoy.button = false;
-            sendControllerInput(neutralJoy);
+            sendControllerInput(neutralJoy, extraButtons);
             // Keep steering responsive while a menu is open.
             sendSteering(joy.x);
         } else {
-            sendControllerInput(joy);
+            sendControllerInput(joy, extraButtons);
             sendSteering(joy.x);
         }
     }
@@ -941,7 +955,7 @@ void loop() {
                   "bat=%.2fV %d%% | mesh ok=%lu fail=%lu\n",
                       joy.x, joy.y, joy.button ? 1 : 0,
                       (unsigned int)g_menuScreen,
-                      g_headingHoldEnabled ? 1 : 0,
+                      g_navHoldActive ? 1 : 0,
                   g_steeringTrimCounts,
                       g_batteryVoltage, g_batteryPercent,
                       (unsigned long)g_sendOkCount,

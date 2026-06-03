@@ -52,10 +52,14 @@ static String g_settingsBody;
 // Both the handheld and the navigation module send MSG_SET_STEERING.
 // The handheld always sends (so steering works without the nav module).
 // When the nav module is actively sending (heading hold), its commands take
-// priority — handheld commands are suppressed for a short window after each
-// nav command so the two don't fight.
+// priority only while handheld is straight/idle. Any non-straight handheld
+// steering command immediately takes over so the user can override heading hold.
 static constexpr unsigned long NAV_PRIORITY_MS = 600;  // suppress handheld for this long after a nav command
 static unsigned long g_lastNavCmdTime = 0;             // timestamp of last nav module command
+static constexpr float HANDHELD_STRAIGHT_DEADZONE = 10.0f / 127.0f;
+static constexpr unsigned long HANDHELD_INPUT_TIMEOUT_MS = 300;
+static float g_lastHandheldLx = 0.0f;
+static unsigned long g_lastHandheldInputMs = 0;
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback – runs in the WiFi driver task context.
@@ -64,6 +68,20 @@ static unsigned long g_lastNavCmdTime = 0;             // timestamp of last nav 
 // aligned values and the ESP32 performs 32-bit loads/stores atomically.
 // ---------------------------------------------------------------------------
 static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) {
+    if (len < 1) return;
+    uint8_t type = data[0];
+
+    if (type == MSG_CONTROLLER_INPUT) {
+        if (len < static_cast<int>(sizeof(ControllerInputMessage))) return;
+        ControllerInputMessage ci;
+        memcpy(&ci, data, sizeof(ci));
+        if (ci.src == MODULE_HANDHELD) {
+            g_lastHandheldLx = ci.lx;
+            g_lastHandheldInputMs = millis();
+        }
+        return;
+    }
+
     if (len < static_cast<int>(sizeof(MeshMessage))) return;
     MeshMessage msg;
     memcpy(&msg, data, sizeof(msg));
@@ -75,9 +93,15 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
             // Navigation module (heading hold) — always accepted, refreshes priority window.
             g_lastNavCmdTime = now;
         } else if (msg.src == MODULE_HANDHELD) {
-            // Handheld — suppressed while the nav module is actively commanding.
-            if ((now - g_lastNavCmdTime) < NAV_PRIORITY_MS) {
-                return;  // ignore — nav module has priority
+            bool handheldInputFresh =
+                (now - g_lastHandheldInputMs) <= HANDHELD_INPUT_TIMEOUT_MS;
+            bool handheldActive = handheldInputFresh &&
+                (g_lastHandheldLx <= -HANDHELD_STRAIGHT_DEADZONE ||
+                 g_lastHandheldLx >= HANDHELD_STRAIGHT_DEADZONE);
+
+            // While nav is active, only suppress handheld when the stick is straight/idle.
+            if ((now - g_lastNavCmdTime) < NAV_PRIORITY_MS && !handheldActive) {
+                return;  // ignore idle handheld input — nav keeps priority
             }
         }
 
