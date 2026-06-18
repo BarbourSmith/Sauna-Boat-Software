@@ -41,7 +41,7 @@ static const char* AP_PASS = "12345678";
 // ---------------------------------------------------------------------------
 static constexpr unsigned long NAV_BROADCAST_MS  = 500;   // 2 Hz mesh broadcast
 static constexpr unsigned long DIAG_LOG_MS       = 1000;  // 1 Hz serial diagnostics
-static constexpr unsigned long CAL_DURATION_MS   = 15000; // calibration collection window
+static constexpr unsigned long CAL_DURATION_MS   = 45000; // calibration collection window
 static constexpr unsigned long CAL_PROGRESS_MS   = 1000;  // calibration progress prints
 static constexpr unsigned long AUTOPILOT_MS      = 200;   // 5 Hz autopilot compute rate
 static constexpr unsigned long AP_SEND_MS        = 50;    // 20 Hz send rate — must be well under the steering watchdog (200 ms)
