@@ -50,6 +50,7 @@ static constexpr float         STICK_OVERRIDE_ENTER = 0.20f; // enter manual-yie
 static constexpr float         STICK_OVERRIDE_EXIT  = 0.10f; // remain in manual-yield until below this magnitude
 static constexpr unsigned long CTRL_INPUT_TIMEOUT_MS = 1000; // controller input considered stale after this
 static constexpr unsigned long HOLD_RESUME_DELAY_MS = 300; // stick must remain centered this long before hold resumes
+static constexpr unsigned long ROUTE_GPS_STALE_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // Heading-hold autopilot tuning (PD controller) — loaded from NVS
@@ -110,6 +111,19 @@ static uint16_t g_ctrlBtns   = 0;
 static uint16_t g_prevBtns   = 0;
 static bool     g_ctrlOnline = false;
 static unsigned long g_lastCtrlInputMs = 0;
+
+// Route upload/execution state.
+static WaypointData g_routePoints[ROUTE_MAX_WAYPOINTS_PER_ROUTE] = {};
+static uint8_t g_routeId = 0;
+static uint8_t g_routeCount = 0;
+static bool g_routeUploadActive = false;
+static bool g_routeRunning = false;
+static uint8_t g_routeCurrentIndex = 0;
+static uint8_t g_routeExpectedWaypoints = 0;
+static uint8_t g_routeExpectedChunks = 0;
+static uint8_t g_routeReceivedWaypoints = 0;
+static uint8_t g_routeNextChunk = 0;
+static uint16_t g_routeDistanceM = 0;
 
 // ESP-NOW diagnostics
 static uint32_t g_sendCount     = 0;
@@ -232,7 +246,11 @@ static float readHeading() {
     float cx = mag.x - g_calOffsetX;
     float cy = mag.y - g_calOffsetY;
 
-    float rawDeg = atan2(cx, cy) * 180.0f / PI;
+    // Sensor is mounted with its Z axis pointing DOWN, which mirrors the
+    // rotation sense of the X-Y plane (heading would count backwards: N->E
+    // reading 0->270). Negate the X component to un-mirror so the heading
+    // increases as the boat turns to starboard (N=0, E=90, S=180, W=270).
+    float rawDeg = atan2(-cx, cy) * 180.0f / PI;
     if (rawDeg < 0) rawDeg += 360.0f;
 
     float rawRad = rawDeg * PI / 180.0f;
@@ -398,6 +416,157 @@ static void broadcastApTuningStatus() {
     }
 }
 
+static void broadcastRouteStatus(uint8_t state) {
+    RouteStatusMessage msg = {};
+    msg.type = MSG_ROUTE_STATUS;
+    msg.src = MODULE_NAVIGATION;
+    msg.routeId = g_routeId;
+    msg.state = state;
+    msg.currentIndex = g_routeCurrentIndex;
+    msg.totalWaypoints = g_routeCount;
+    msg.distanceM = g_routeDistanceM;
+    esp_now_send(MESH_BROADCAST_ADDR,
+                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+}
+
+static void broadcastWaypointReached(uint8_t waypointIndex) {
+    WaypointReachedMessage msg = {};
+    msg.type = MSG_WAYPOINT_REACHED;
+    msg.src = MODULE_NAVIGATION;
+    msg.routeId = g_routeId;
+    msg.waypointIndex = waypointIndex;
+    esp_now_send(MESH_BROADCAST_ADDR,
+                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+}
+
+static void broadcastRouteComplete() {
+    RouteCompleteMessage msg = {};
+    msg.type = MSG_ROUTE_COMPLETE;
+    msg.src = MODULE_NAVIGATION;
+    msg.routeId = g_routeId;
+    esp_now_send(MESH_BROADCAST_ADDR,
+                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+}
+
+static void broadcastRouteAbort(uint8_t reason) {
+    RouteAbortMessage msg = {};
+    msg.type = MSG_ROUTE_ABORT;
+    msg.src = MODULE_NAVIGATION;
+    msg.routeId = g_routeId;
+    msg.reason = reason;
+    esp_now_send(MESH_BROADCAST_ADDR,
+                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+}
+
+static bool isValidWaypoint(const WaypointData& wp) {
+    double lat = (double)wp.latE7 / 10000000.0;
+    double lon = (double)wp.lonE7 / 10000000.0;
+    if (lat < -90.0 || lat > 90.0) return false;
+    if (lon < -180.0 || lon > 180.0) return false;
+    if (wp.radiusM == 0) return false;
+    return true;
+}
+
+static void resetRouteUploadState() {
+    g_routeUploadActive = false;
+    g_routeExpectedWaypoints = 0;
+    g_routeExpectedChunks = 0;
+    g_routeReceivedWaypoints = 0;
+    g_routeNextChunk = 0;
+}
+
+static void abortRoute(uint8_t reason) {
+    g_routeRunning = false;
+    g_routeCurrentIndex = 0;
+    g_routeDistanceM = 0;
+    disengageHeadingHold();
+    sendSteeringSpeed(0.0f);
+    broadcastRouteAbort(reason);
+    broadcastRouteStatus(ROUTE_STATE_ABORTED);
+}
+
+static bool startRouteExecution() {
+    if (g_routeCount == 0) {
+        abortRoute(ROUTE_ABORT_EMPTY_ROUTE);
+        return false;
+    }
+    if (!g_bmm150Ok) {
+        abortRoute(ROUTE_ABORT_NO_HEADING);
+        return false;
+    }
+    if (!gps.location.isValid() || gps.location.age() > ROUTE_GPS_STALE_MS) {
+        abortRoute(ROUTE_ABORT_NO_GPS_FIX);
+        return false;
+    }
+
+    g_routeRunning = true;
+    g_routeCurrentIndex = 0;
+    g_routeDistanceM = 0;
+    if (!g_headingHoldActive) {
+        engageHeadingHold();
+    }
+    broadcastRouteStatus(ROUTE_STATE_RUNNING);
+    Serial.printf("[Route] START route=%u waypoints=%u\n", g_routeId, g_routeCount);
+    return true;
+}
+
+static void updateRouteGuidance() {
+    if (!g_routeRunning) return;
+
+    if (!gps.location.isValid() || gps.location.age() > ROUTE_GPS_STALE_MS) {
+        abortRoute(ROUTE_ABORT_NO_GPS_FIX);
+        return;
+    }
+
+    if (!g_bmm150Ok) {
+        abortRoute(ROUTE_ABORT_NO_HEADING);
+        return;
+    }
+
+    if (g_routeCurrentIndex >= g_routeCount) {
+        g_routeRunning = false;
+        broadcastRouteComplete();
+        broadcastRouteStatus(ROUTE_STATE_COMPLETE);
+        disengageHeadingHold();
+        sendSteeringSpeed(0.0f);
+        return;
+    }
+
+    WaypointData wp = g_routePoints[g_routeCurrentIndex];
+    double tgtLat = (double)wp.latE7 / 10000000.0;
+    double tgtLon = (double)wp.lonE7 / 10000000.0;
+    double curLat = gps.location.lat();
+    double curLon = gps.location.lng();
+
+    double distance = TinyGPSPlus::distanceBetween(curLat, curLon, tgtLat, tgtLon);
+    if (distance < 0.0) distance = 0.0;
+    if (distance > 65535.0) distance = 65535.0;
+    g_routeDistanceM = (uint16_t)distance;
+
+    uint16_t radiusM = wp.radiusM == 0 ? ROUTE_DEFAULT_RADIUS_M : wp.radiusM;
+    if (distance <= radiusM) {
+        broadcastWaypointReached(g_routeCurrentIndex);
+        ++g_routeCurrentIndex;
+        if (g_routeCurrentIndex >= g_routeCount) {
+            g_routeRunning = false;
+            broadcastRouteComplete();
+            broadcastRouteStatus(ROUTE_STATE_COMPLETE);
+            disengageHeadingHold();
+            sendSteeringSpeed(0.0f);
+            Serial.println("[Route] COMPLETE");
+            return;
+        }
+    }
+
+    WaypointData nextWp = g_routePoints[g_routeCurrentIndex];
+    double nextLat = (double)nextWp.latE7 / 10000000.0;
+    double nextLon = (double)nextWp.lonE7 / 10000000.0;
+    g_targetHeading = (float)TinyGPSPlus::courseTo(curLat, curLon, nextLat, nextLon);
+    if (!g_headingHoldActive) {
+        engageHeadingHold();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback
 // ---------------------------------------------------------------------------
@@ -438,6 +607,105 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
                       paramId, value, g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
         return;
     }
+
+    if (type == MSG_ROUTE_START && len >= static_cast<int>(sizeof(RouteStartMessage))) {
+        RouteStartMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_HANDHELD) return;
+
+        if (m.totalWaypoints == 0 || m.totalWaypoints > ROUTE_MAX_WAYPOINTS_PER_ROUTE) {
+            broadcastRouteAbort(ROUTE_ABORT_BAD_FORMAT);
+            return;
+        }
+
+        g_routeId = m.routeId;
+        g_routeCount = 0;
+        g_routeExpectedWaypoints = m.totalWaypoints;
+        g_routeExpectedChunks = m.totalChunks;
+        g_routeReceivedWaypoints = 0;
+        g_routeNextChunk = 0;
+        g_routeUploadActive = true;
+        g_routeRunning = false;
+        memset(g_routePoints, 0, sizeof(g_routePoints));
+        broadcastRouteStatus(ROUTE_STATE_UPLOADING);
+        Serial.printf("[Route] START upload route=%u wps=%u chunks=%u\n",
+                      g_routeId, g_routeExpectedWaypoints, g_routeExpectedChunks);
+        return;
+    }
+
+    if (type == MSG_ROUTE_CHUNK && len >= static_cast<int>(sizeof(RouteChunkMessage))) {
+        RouteChunkMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_HANDHELD) return;
+        if (!g_routeUploadActive || m.routeId != g_routeId) return;
+
+        if (m.chunkIndex != g_routeNextChunk) {
+            resetRouteUploadState();
+            broadcastRouteAbort(ROUTE_ABORT_BAD_SEQUENCE);
+            return;
+        }
+
+        if (m.waypointCount == 0 || m.waypointCount > ROUTE_WAYPOINTS_PER_CHUNK) {
+            resetRouteUploadState();
+            broadcastRouteAbort(ROUTE_ABORT_BAD_FORMAT);
+            return;
+        }
+
+        for (uint8_t i = 0; i < m.waypointCount; ++i) {
+            if (g_routeReceivedWaypoints >= ROUTE_MAX_WAYPOINTS_PER_ROUTE) {
+                resetRouteUploadState();
+                broadcastRouteAbort(ROUTE_ABORT_BAD_FORMAT);
+                return;
+            }
+
+            WaypointData wp = m.waypoints[i];
+            if (wp.radiusM == 0) wp.radiusM = ROUTE_DEFAULT_RADIUS_M;
+            if (!isValidWaypoint(wp)) {
+                resetRouteUploadState();
+                broadcastRouteAbort(ROUTE_ABORT_BAD_WAYPOINT);
+                return;
+            }
+            g_routePoints[g_routeReceivedWaypoints++] = wp;
+        }
+
+        ++g_routeNextChunk;
+        return;
+    }
+
+    if (type == MSG_ROUTE_END && len >= static_cast<int>(sizeof(RouteEndMessage))) {
+        RouteEndMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_HANDHELD) return;
+        if (!g_routeUploadActive || m.routeId != g_routeId) return;
+
+        bool ok = (g_routeReceivedWaypoints == g_routeExpectedWaypoints) &&
+                  (g_routeNextChunk == g_routeExpectedChunks);
+        if (!ok) {
+            resetRouteUploadState();
+            broadcastRouteAbort(ROUTE_ABORT_BAD_SEQUENCE);
+            return;
+        }
+
+        g_routeCount = g_routeReceivedWaypoints;
+        resetRouteUploadState();
+        broadcastRouteStatus(ROUTE_STATE_READY);
+        Serial.printf("[Route] Upload complete route=%u wps=%u\n", g_routeId, g_routeCount);
+        return;
+    }
+
+    if (type == MSG_ROUTE_CONTROL && len >= static_cast<int>(sizeof(RouteControlMessage))) {
+        RouteControlMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_HANDHELD) return;
+        if (m.routeId != g_routeId) return;
+
+        if (m.action == ROUTE_ACTION_START) {
+            startRouteExecution();
+        } else if (m.action == ROUTE_ACTION_STOP) {
+            abortRoute(ROUTE_ABORT_STOP_REQUESTED);
+        }
+        return;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +727,12 @@ static void buildStatusJson(String& out) {
     out += ",\"steer\":";    out += String(g_apOutput, 3);
     out += ",\"ctrl\":";     out += g_ctrlOnline ? "true" : "false";
     out += ",\"stick\":";    out += String(g_stickLX, 2);
+    out += ",\"routeId\":"; out += (unsigned long)g_routeId;
+    out += ",\"routeCount\":"; out += (unsigned long)g_routeCount;
+    out += ",\"routeIdx\":"; out += (unsigned long)g_routeCurrentIndex;
+    out += ",\"routeRun\":"; out += g_routeRunning ? "true" : "false";
+    out += ",\"routeUp\":"; out += g_routeUploadActive ? "true" : "false";
+    out += ",\"routeDist\":"; out += (unsigned long)g_routeDistanceM;
     out += ",\"gpsFix\":";   out += gps.location.isValid() ? "true" : "false";
     out += ",\"gpsSats\":";  out += (unsigned long)gps.satellites.value();
     if (gps.location.isValid()) {
@@ -675,10 +949,16 @@ void loop() {
             engageHeadingHold();
         }
         if (dnNow && !dnPrev && g_headingHoldActive) {
-            disengageHeadingHold();
+            if (g_routeRunning) {
+                abortRoute(ROUTE_ABORT_STOP_REQUESTED);
+            } else {
+                disengageHeadingHold();
+            }
         }
         g_prevBtns = g_ctrlBtns;
     }
+
+    updateRouteGuidance();
 
     if (g_headingHoldActive) {
             bool ctrlFresh = g_ctrlOnline && ((now - g_lastCtrlInputMs) <= CTRL_INPUT_TIMEOUT_MS);
@@ -719,7 +999,7 @@ void loop() {
                 }
                 if (now - lastApSend >= AP_SEND_MS) {
                     lastApSend = now;
-                    sendSteeringSpeed(-g_apOutput);
+                    sendSteeringSpeed(g_apOutput);
                 }
                 }
             }
@@ -750,6 +1030,15 @@ void loop() {
         broadcastNavStatus();
         broadcastHeadingHoldStatus();
         broadcastApTuningStatus();
+        if (g_routeUploadActive) {
+            broadcastRouteStatus(ROUTE_STATE_UPLOADING);
+        } else if (g_routeRunning) {
+            broadcastRouteStatus(ROUTE_STATE_RUNNING);
+        } else if (g_routeCount > 0) {
+            broadcastRouteStatus(ROUTE_STATE_READY);
+        } else {
+            broadcastRouteStatus(ROUTE_STATE_IDLE);
+        }
     }
 
     // Broadcast status to WebSocket clients.

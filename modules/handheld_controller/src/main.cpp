@@ -147,6 +147,8 @@ enum class MenuScreen : uint8_t {
     ROOT,
     SETTINGS,
     NAVIGATION,
+    ROUTES,
+    ROUTE_RENAME,
     NAV_INFO,
     STEERING_TRIM,
     BATTERY,
@@ -157,10 +159,40 @@ static MenuScreen g_menuScreen = MenuScreen::NONE;
 static int g_menuSelectionRoot = 0;
 static int g_menuSelectionSettings = 0;
 static int g_menuSelectionNav  = 0;
+static int g_menuSelectionRoutes = 0;
 static int g_menuSelectionApTuning = 0;
 static bool g_settingsDirty = false;
 static uint8_t g_holdRequestPulses   = 0;
 static uint8_t g_holdDisengagePulses = 0;
+
+struct RouteStore {
+    uint8_t count;
+    WaypointData points[ROUTE_MAX_WAYPOINTS_PER_ROUTE];
+};
+
+static RouteStore g_routes[ROUTE_MAX_ROUTES] = {};
+static uint8_t g_activeRouteId = 0;
+static uint8_t g_selectedWaypointIndex = 0;
+static char g_routeNames[ROUTE_MAX_ROUTES][16] = {};
+static char g_renameBuffer[16] = {};
+static uint8_t g_renameCursor = 0;
+static char g_routeNotice[32] = "Route idle";
+
+static float g_navLat = NAN;
+static float g_navLon = NAN;
+
+enum class RouteTxStage : uint8_t {
+    IDLE,
+    SEND_START,
+    SEND_CHUNK,
+    SEND_END,
+    SEND_CONTROL,
+};
+
+static RouteTxStage g_routeTxStage = RouteTxStage::IDLE;
+static uint8_t g_routeTxRouteId = 0;
+static uint8_t g_routeTxChunkIndex = 0;
+static unsigned long g_routeTxNextMs = 0;
 
 // Local mirror of nav autopilot tuning values (received via MSG_AP_TUNING echo or initialised on connect)
 static float g_apKp        = 0.008f;
@@ -173,6 +205,332 @@ static float g_apRateLimit = 0.05f;
 static bool g_prevButtonPressed = false;
 static unsigned long g_lastMenuMoveMs = 0;
 static unsigned long g_lastButtonEventMs = 0;
+
+static constexpr uint16_t ROUTE_RADIUS_MIN_M = 1;
+static constexpr uint16_t ROUTE_RADIUS_MAX_M = 100;
+static constexpr char ROUTE_RENAME_ALPHABET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+
+static void setRouteNotice(const char* text);
+static void saveRoutesToNVS();
+
+static void setDefaultRouteName(uint8_t routeId, char* out, size_t outSize) {
+    snprintf(out, outSize, "Route %u", (unsigned)(routeId + 1));
+}
+
+static void initRouteNames() {
+    for (uint8_t i = 0; i < ROUTE_MAX_ROUTES; ++i) {
+        setDefaultRouteName(i, g_routeNames[i], sizeof(g_routeNames[i]));
+    }
+}
+
+static void clampSelectedWaypoint() {
+    uint8_t count = g_routes[g_activeRouteId].count;
+    if (count == 0) {
+        g_selectedWaypointIndex = 0;
+        return;
+    }
+    if (g_selectedWaypointIndex >= count) {
+        g_selectedWaypointIndex = count - 1;
+    }
+}
+
+static WaypointData* selectedWaypoint() {
+    RouteStore& route = g_routes[g_activeRouteId];
+    if (route.count == 0) return nullptr;
+    clampSelectedWaypoint();
+    return &route.points[g_selectedWaypointIndex];
+}
+
+static void selectNextWaypoint(int delta) {
+    RouteStore& route = g_routes[g_activeRouteId];
+    if (route.count == 0) {
+        setRouteNotice("No waypoints");
+        return;
+    }
+
+    int next = (int)g_selectedWaypointIndex + delta;
+    if (next < 0) next = route.count - 1;
+    if (next >= route.count) next = 0;
+    g_selectedWaypointIndex = (uint8_t)next;
+    setRouteNotice("Waypoint selected");
+}
+
+static void adjustSelectedWaypointRadius(int delta) {
+    WaypointData* wp = selectedWaypoint();
+    if (!wp) {
+        setRouteNotice("No waypoints");
+        return;
+    }
+
+    int next = (int)wp->radiusM + delta;
+    if (next < (int)ROUTE_RADIUS_MIN_M) next = ROUTE_RADIUS_MIN_M;
+    if (next > (int)ROUTE_RADIUS_MAX_M) next = ROUTE_RADIUS_MAX_M;
+    wp->radiusM = (uint16_t)next;
+    saveRoutesToNVS();
+    setRouteNotice("Radius updated");
+}
+
+static void deleteSelectedWaypoint() {
+    RouteStore& route = g_routes[g_activeRouteId];
+    if (route.count == 0) {
+        setRouteNotice("No waypoints");
+        return;
+    }
+
+    clampSelectedWaypoint();
+    for (uint8_t i = g_selectedWaypointIndex + 1; i < route.count; ++i) {
+        route.points[i - 1] = route.points[i];
+    }
+    --route.count;
+    clampSelectedWaypoint();
+    saveRoutesToNVS();
+    setRouteNotice("Waypoint deleted");
+}
+
+static void beginRenameRoute() {
+    snprintf(g_renameBuffer, sizeof(g_renameBuffer), "%s", g_routeNames[g_activeRouteId]);
+    g_renameCursor = 0;
+    g_menuScreen = MenuScreen::ROUTE_RENAME;
+    setRouteNotice("Rename route");
+}
+
+static int renameAlphabetIndex(char ch) {
+    const char* p = strchr(ROUTE_RENAME_ALPHABET, ch);
+    if (!p) return 0;
+    return (int)(p - ROUTE_RENAME_ALPHABET);
+}
+
+static void renameAdjustChar(int delta) {
+    size_t n = strlen(ROUTE_RENAME_ALPHABET);
+    if (n == 0 || g_renameCursor >= sizeof(g_renameBuffer) - 1) return;
+
+    char cur = g_renameBuffer[g_renameCursor];
+    int idx = renameAlphabetIndex(cur);
+    idx += delta;
+    if (idx < 0) idx = (int)n - 1;
+    if (idx >= (int)n) idx = 0;
+    g_renameBuffer[g_renameCursor] = ROUTE_RENAME_ALPHABET[idx];
+}
+
+static void renameMoveCursor(int delta) {
+    int next = (int)g_renameCursor + delta;
+    int maxPos = (int)sizeof(g_renameBuffer) - 2;
+    if (next < 0) next = maxPos;
+    if (next > maxPos) next = 0;
+    g_renameCursor = (uint8_t)next;
+}
+
+static void commitRenameRoute() {
+    // Trim trailing spaces to keep display compact.
+    int end = (int)strlen(g_renameBuffer) - 1;
+    while (end >= 0 && g_renameBuffer[end] == ' ') {
+        g_renameBuffer[end] = '\0';
+        --end;
+    }
+    if (strlen(g_renameBuffer) == 0) {
+        setDefaultRouteName(g_activeRouteId, g_routeNames[g_activeRouteId], sizeof(g_routeNames[g_activeRouteId]));
+    } else {
+        snprintf(g_routeNames[g_activeRouteId], sizeof(g_routeNames[g_activeRouteId]), "%s", g_renameBuffer);
+    }
+    saveRoutesToNVS();
+    setRouteNotice("Name saved");
+}
+
+static void setRouteNotice(const char* text) {
+    snprintf(g_routeNotice, sizeof(g_routeNotice), "%s", text);
+}
+
+static void saveRoutesToNVS() {
+    preferences.begin("routes", false);
+    preferences.putUChar("ver", 1);
+    preferences.putUChar("active", g_activeRouteId);
+
+    for (uint8_t i = 0; i < ROUTE_MAX_ROUTES; ++i) {
+        char countKey[8] = {};
+        char dataKey[8] = {};
+        char nameKey[8] = {};
+        snprintf(countKey, sizeof(countKey), "c%u", i);
+        snprintf(dataKey, sizeof(dataKey), "r%u", i);
+        snprintf(nameKey, sizeof(nameKey), "n%u", i);
+
+        uint8_t count = g_routes[i].count;
+        if (count > ROUTE_MAX_WAYPOINTS_PER_ROUTE) {
+            count = ROUTE_MAX_WAYPOINTS_PER_ROUTE;
+        }
+
+        preferences.putUChar(countKey, count);
+        preferences.putString(nameKey, g_routeNames[i]);
+        if (count > 0) {
+            preferences.putBytes(dataKey, g_routes[i].points, count * sizeof(WaypointData));
+        }
+    }
+    preferences.end();
+}
+
+static void loadRoutesFromNVS() {
+    memset(g_routes, 0, sizeof(g_routes));
+    g_activeRouteId = 0;
+    g_selectedWaypointIndex = 0;
+    initRouteNames();
+
+    preferences.begin("routes", true);
+    uint8_t ver = preferences.getUChar("ver", 0);
+    if (ver == 1) {
+        g_activeRouteId = preferences.getUChar("active", 0);
+        if (g_activeRouteId >= ROUTE_MAX_ROUTES) g_activeRouteId = 0;
+
+        for (uint8_t i = 0; i < ROUTE_MAX_ROUTES; ++i) {
+            char countKey[8] = {};
+            char dataKey[8] = {};
+            char nameKey[8] = {};
+            snprintf(countKey, sizeof(countKey), "c%u", i);
+            snprintf(dataKey, sizeof(dataKey), "r%u", i);
+            snprintf(nameKey, sizeof(nameKey), "n%u", i);
+
+            String routeName = preferences.getString(nameKey, "");
+            if (routeName.length() > 0) {
+                routeName.toCharArray(g_routeNames[i], sizeof(g_routeNames[i]));
+            }
+
+            uint8_t count = preferences.getUChar(countKey, 0);
+            if (count > ROUTE_MAX_WAYPOINTS_PER_ROUTE) count = ROUTE_MAX_WAYPOINTS_PER_ROUTE;
+            g_routes[i].count = count;
+
+            if (count > 0) {
+                size_t got = preferences.getBytes(dataKey, g_routes[i].points, count * sizeof(WaypointData));
+                if (got != count * sizeof(WaypointData)) {
+                    g_routes[i].count = 0;
+                }
+            }
+        }
+    }
+    preferences.end();
+
+    clampSelectedWaypoint();
+}
+
+static bool hasFreshNavFix(unsigned long now) {
+    bool fresh = (g_lastNavMs != 0) && (now - g_lastNavMs < 2000);
+    bool valid = g_navFixType > 0 && !isnan(g_navLat) && !isnan(g_navLon);
+    return fresh && valid;
+}
+
+static void appendCurrentLocationToActiveRoute(unsigned long now) {
+    if (!hasFreshNavFix(now)) {
+        setRouteNotice("No GPS fix");
+        return;
+    }
+
+    RouteStore& route = g_routes[g_activeRouteId];
+    if (route.count >= ROUTE_MAX_WAYPOINTS_PER_ROUTE) {
+        setRouteNotice("Route full");
+        return;
+    }
+
+    WaypointData wp = {};
+    wp.latE7 = (int32_t)lroundf(g_navLat * 10000000.0f);
+    wp.lonE7 = (int32_t)lroundf(g_navLon * 10000000.0f);
+    wp.radiusM = ROUTE_DEFAULT_RADIUS_M;
+    route.points[route.count++] = wp;
+    g_selectedWaypointIndex = route.count - 1;
+    saveRoutesToNVS();
+    setRouteNotice("Waypoint added");
+}
+
+static void clearActiveRoute() {
+    g_routes[g_activeRouteId].count = 0;
+    g_selectedWaypointIndex = 0;
+    saveRoutesToNVS();
+    setRouteNotice("Route cleared");
+}
+
+static uint8_t routeChunkCount(uint8_t waypointCount) {
+    return (waypointCount + ROUTE_WAYPOINTS_PER_CHUNK - 1) / ROUTE_WAYPOINTS_PER_CHUNK;
+}
+
+static void startRouteTransfer() {
+    const RouteStore& route = g_routes[g_activeRouteId];
+    if (route.count == 0) {
+        setRouteNotice("Route empty");
+        return;
+    }
+
+    g_routeTxRouteId = g_activeRouteId;
+    g_routeTxChunkIndex = 0;
+    g_routeTxStage = RouteTxStage::SEND_START;
+    g_routeTxNextMs = 0;
+    setRouteNotice("Uploading...");
+}
+
+static void processRouteTransfer(unsigned long now) {
+    if (g_routeTxStage == RouteTxStage::IDLE) return;
+    if (now < g_routeTxNextMs) return;
+
+    const RouteStore& route = g_routes[g_routeTxRouteId];
+    uint8_t totalChunks = routeChunkCount(route.count);
+
+    if (g_routeTxStage == RouteTxStage::SEND_START) {
+        RouteStartMessage start = {};
+        start.type = MSG_ROUTE_START;
+        start.src = MODULE_HANDHELD;
+        start.routeId = g_routeTxRouteId;
+        start.totalWaypoints = route.count;
+        start.totalChunks = totalChunks;
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&start), sizeof(start));
+        g_routeTxStage = RouteTxStage::SEND_CHUNK;
+        g_routeTxNextMs = now + SEND_INTERVAL_MS;
+        return;
+    }
+
+    if (g_routeTxStage == RouteTxStage::SEND_CHUNK) {
+        if (g_routeTxChunkIndex >= totalChunks) {
+            g_routeTxStage = RouteTxStage::SEND_END;
+            g_routeTxNextMs = now + SEND_INTERVAL_MS;
+            return;
+        }
+
+        RouteChunkMessage chunk = {};
+        chunk.type = MSG_ROUTE_CHUNK;
+        chunk.src = MODULE_HANDHELD;
+        chunk.routeId = g_routeTxRouteId;
+        chunk.chunkIndex = g_routeTxChunkIndex;
+
+        uint8_t base = g_routeTxChunkIndex * ROUTE_WAYPOINTS_PER_CHUNK;
+        uint8_t remaining = route.count - base;
+        chunk.waypointCount = remaining > ROUTE_WAYPOINTS_PER_CHUNK ? ROUTE_WAYPOINTS_PER_CHUNK : remaining;
+        for (uint8_t i = 0; i < chunk.waypointCount; ++i) {
+            chunk.waypoints[i] = route.points[base + i];
+        }
+
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&chunk), sizeof(chunk));
+        ++g_routeTxChunkIndex;
+        g_routeTxNextMs = now + SEND_INTERVAL_MS;
+        return;
+    }
+
+    if (g_routeTxStage == RouteTxStage::SEND_END) {
+        RouteEndMessage end = {};
+        end.type = MSG_ROUTE_END;
+        end.src = MODULE_HANDHELD;
+        end.routeId = g_routeTxRouteId;
+        end.crc16 = 0;
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&end), sizeof(end));
+        g_routeTxStage = RouteTxStage::SEND_CONTROL;
+        g_routeTxNextMs = now + SEND_INTERVAL_MS;
+        return;
+    }
+
+    if (g_routeTxStage == RouteTxStage::SEND_CONTROL) {
+        RouteControlMessage ctrl = {};
+        ctrl.type = MSG_ROUTE_CONTROL;
+        ctrl.src = MODULE_HANDHELD;
+        ctrl.action = ROUTE_ACTION_START;
+        ctrl.routeId = g_routeTxRouteId;
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&ctrl), sizeof(ctrl));
+        g_routeTxStage = RouteTxStage::IDLE;
+        setRouteNotice("Route sent");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Battery
@@ -318,6 +676,8 @@ static void onDataRecv(const uint8_t* /*mac*/,
         g_navHeading    = m.heading;
         g_navCourse     = m.course;
         g_navSpeedKnots = m.speedKnots;
+        g_navLat        = m.lat;
+        g_navLon        = m.lon;
         g_navFixType    = m.fixType;
         g_navSatellites = m.satellites;
         g_lastNavMs     = millis();
@@ -378,6 +738,47 @@ static void onDataRecv(const uint8_t* /*mac*/,
         if (m.src != MODULE_NAVIGATION) return;
         g_navSteerCmd = constrain(m.value1, -1.0f, 1.0f);
         g_lastNavSteerMs = millis();
+        return;
+    }
+
+    if (type == MSG_ROUTE_STATUS && len >= (int)sizeof(RouteStatusMessage)) {
+        RouteStatusMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        if (m.state == ROUTE_STATE_RUNNING) {
+            snprintf(g_routeNotice, sizeof(g_routeNotice), "Run %u/%u %um",
+                     (unsigned)(m.currentIndex + 1),
+                     (unsigned)m.totalWaypoints,
+                     (unsigned)m.distanceM);
+        } else if (m.state == ROUTE_STATE_READY) {
+            setRouteNotice("Route ready");
+        } else if (m.state == ROUTE_STATE_UPLOADING) {
+            setRouteNotice("Uploading...");
+        }
+        return;
+    }
+
+    if (type == MSG_WAYPOINT_REACHED && len >= (int)sizeof(WaypointReachedMessage)) {
+        WaypointReachedMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        snprintf(g_routeNotice, sizeof(g_routeNotice), "Reached wp %u", (unsigned)(m.waypointIndex + 1));
+        return;
+    }
+
+    if (type == MSG_ROUTE_COMPLETE && len >= (int)sizeof(RouteCompleteMessage)) {
+        RouteCompleteMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        setRouteNotice("Route complete");
+        return;
+    }
+
+    if (type == MSG_ROUTE_ABORT && len >= (int)sizeof(RouteAbortMessage)) {
+        RouteAbortMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        snprintf(g_routeNotice, sizeof(g_routeNotice), "Route abort %u", (unsigned)m.reason);
         return;
     }
 }
@@ -609,14 +1010,73 @@ static void drawDisplay(const JoystickReading& joy) {
             display.setCursor(0, 0);
             display.println(F("Navigation"));
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
-            drawMenuLine(16, g_menuSelectionNav == 0, "Heading Hold");
-            drawMenuLine(28, g_menuSelectionNav == 1, "AP Tuning");
-            display.setCursor(0, 40);
-            display.print(g_menuSelectionNav == 2 ? F("> ") : F("  "));
-            display.print(F("Info"));
+            drawMenuLine(14, g_menuSelectionNav == 0, "Heading Hold");
+            drawMenuLine(24, g_menuSelectionNav == 1, "AP Tuning");
+            drawMenuLine(34, g_menuSelectionNav == 2, "Routes");
+            drawMenuLine(44, g_menuSelectionNav == 3, "Info");
             display.setCursor(96, 16);
             display.print(g_navHoldActive ? F("ON") : F("OFF"));
-            drawMenuLine(52, g_menuSelectionNav == 3, "Back");
+            drawMenuLine(54, g_menuSelectionNav == 4, "Back");
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::ROUTES) {
+            const RouteStore& route = g_routes[g_activeRouteId];
+            int startIndex = g_menuSelectionRoutes - 2;
+            if (startIndex < 0) startIndex = 0;
+            if (startIndex > 4) startIndex = 4;
+
+            display.setCursor(0, 0);
+            display.println(F("Routes"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            display.setCursor(0, 12);
+            display.printf("%s", g_routeNames[g_activeRouteId]);
+            display.setCursor(0, 20);
+            if (route.count > 0) {
+                uint8_t idx = g_selectedWaypointIndex;
+                if (idx >= route.count) idx = route.count - 1;
+                display.printf("WP %u/%u R%um", (unsigned)(idx + 1), (unsigned)route.count,
+                               (unsigned)route.points[idx].radiusM);
+            } else {
+                display.print(F("WP 0/0"));
+            }
+
+            for (int row = 0; row < 5; ++row) {
+                int item = startIndex + row;
+                int y = 28 + row * 7;
+                display.setCursor(0, y);
+                display.print(g_menuSelectionRoutes == item ? F("> ") : F("  "));
+                switch (item) {
+                    case 0: display.print(F("Append current")); break;
+                    case 1: display.print(F("Select waypoint")); break;
+                    case 2: display.print(F("Delete waypoint")); break;
+                    case 3: display.print(F("Radius +/-")); break;
+                    case 4: display.print(F("Send + Start")); break;
+                    case 5: display.print(F("Rename route")); break;
+                    case 6: display.print(F("Next route")); break;
+                    case 7: display.print(F("Clear route")); break;
+                    default: display.print(F("Back")); break;
+                }
+            }
+            display.display();
+            return;
+        }
+
+        if (g_menuScreen == MenuScreen::ROUTE_RENAME) {
+            display.setCursor(0, 0);
+            display.println(F("Rename Route"));
+            display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.print(g_renameBuffer);
+            display.setCursor(0, 30);
+            for (uint8_t i = 0; i < sizeof(g_renameBuffer) - 1; ++i) {
+                display.print(i == g_renameCursor ? '^' : ' ');
+            }
+            display.setCursor(0, 44);
+            display.print(F("Y:cursor X:char"));
+            display.setCursor(0, 54);
+            display.print(F("Click: Save"));
             display.display();
             return;
         }
@@ -759,8 +1219,12 @@ static void moveMenuSelection(int delta) {
         if (g_menuSelectionSettings > 5) g_menuSelectionSettings = 0;
     } else if (g_menuScreen == MenuScreen::NAVIGATION) {
         g_menuSelectionNav += delta;
-        if (g_menuSelectionNav < 0) g_menuSelectionNav = 3;
-        if (g_menuSelectionNav > 3) g_menuSelectionNav = 0;
+        if (g_menuSelectionNav < 0) g_menuSelectionNav = 4;
+        if (g_menuSelectionNav > 4) g_menuSelectionNav = 0;
+    } else if (g_menuScreen == MenuScreen::ROUTES) {
+        g_menuSelectionRoutes += delta;
+        if (g_menuSelectionRoutes < 0) g_menuSelectionRoutes = 8;
+        if (g_menuSelectionRoutes > 8) g_menuSelectionRoutes = 0;
     } else if (g_menuScreen == MenuScreen::AP_TUNING) {
         g_menuSelectionApTuning += delta;
         if (g_menuSelectionApTuning < 0) g_menuSelectionApTuning = 5;
@@ -832,10 +1296,44 @@ static void onMenuClick() {
         } else if (g_menuSelectionNav == 1) {
             g_menuScreen = MenuScreen::AP_TUNING;
         } else if (g_menuSelectionNav == 2) {
+            g_menuScreen = MenuScreen::ROUTES;
+        } else if (g_menuSelectionNav == 3) {
             g_menuScreen = MenuScreen::NAV_INFO;
         } else {
             g_menuScreen = MenuScreen::ROOT;
         }
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::ROUTES) {
+        if (g_menuSelectionRoutes == 0) {
+            appendCurrentLocationToActiveRoute(millis());
+        } else if (g_menuSelectionRoutes == 1) {
+            selectNextWaypoint(1);
+        } else if (g_menuSelectionRoutes == 2) {
+            deleteSelectedWaypoint();
+        } else if (g_menuSelectionRoutes == 3) {
+            adjustSelectedWaypointRadius(1);
+        } else if (g_menuSelectionRoutes == 4) {
+            startRouteTransfer();
+        } else if (g_menuSelectionRoutes == 5) {
+            beginRenameRoute();
+        } else if (g_menuSelectionRoutes == 6) {
+            g_activeRouteId = (g_activeRouteId + 1) % ROUTE_MAX_ROUTES;
+            clampSelectedWaypoint();
+            saveRoutesToNVS();
+            setRouteNotice("Route selected");
+        } else if (g_menuSelectionRoutes == 7) {
+            clearActiveRoute();
+        } else {
+            g_menuScreen = MenuScreen::NAVIGATION;
+        }
+        return;
+    }
+
+    if (g_menuScreen == MenuScreen::ROUTE_RENAME) {
+        commitRenameRoute();
+        g_menuScreen = MenuScreen::ROUTES;
         return;
     }
 
@@ -879,6 +1377,42 @@ static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
 
         if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
             moveMenuSelection(menuDelta);
+            g_lastMenuMoveMs = now;
+        }
+    } else if (g_menuScreen == MenuScreen::ROUTES) {
+        int menuDelta = 0;
+        if (joy.y > 0.6f) menuDelta = 1;
+        else if (joy.y < -0.6f) menuDelta = -1;
+        if (menuDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            moveMenuSelection(menuDelta);
+            g_lastMenuMoveMs = now;
+        }
+
+        int xDelta = 0;
+        if (joy.x > 0.6f) xDelta = 1;
+        else if (joy.x < -0.6f) xDelta = -1;
+        if (xDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            if (g_menuSelectionRoutes == 1) {
+                selectNextWaypoint(xDelta);
+            } else if (g_menuSelectionRoutes == 3) {
+                adjustSelectedWaypointRadius(xDelta);
+            }
+            g_lastMenuMoveMs = now;
+        }
+    } else if (g_menuScreen == MenuScreen::ROUTE_RENAME) {
+        int yDelta = 0;
+        if (joy.y > 0.6f) yDelta = 1;
+        else if (joy.y < -0.6f) yDelta = -1;
+        if (yDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            renameMoveCursor(yDelta);
+            g_lastMenuMoveMs = now;
+        }
+
+        int xDelta = 0;
+        if (joy.x > 0.6f) xDelta = 1;
+        else if (joy.x < -0.6f) xDelta = -1;
+        if (xDelta != 0 && (now - g_lastMenuMoveMs >= MENU_NAV_REPEAT_MS)) {
+            renameAdjustChar(xDelta);
             g_lastMenuMoveMs = now;
         }
     } else if (g_menuScreen == MenuScreen::STEERING_TRIM) {
@@ -942,6 +1476,7 @@ void setup() {
     pinMode(JOY_BTN_PIN, INPUT_PULLUP);
 
     loadSettings();
+    loadRoutesFromNVS();
     Serial.printf("[Setup] idle sleep timeout = %s\n",
                   g_idleSleepEnabled ? "ENABLED" : "DISABLED");
     Serial.printf("[Setup] wake-on-click = %s\n",
@@ -1030,6 +1565,7 @@ void loop() {
 
     JoystickReading joy = readJoystick();
     handleMenuInput(joy, now);
+    processRouteTransfer(now);
 
     // Activity detection: any deflection or button press resets the idle timer.
     if (fabsf(joy.x) > 0.05f || fabsf(joy.y) > 0.05f || joy.button) {

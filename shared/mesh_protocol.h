@@ -82,6 +82,37 @@
 //   value2 = current value for that parameter.
 #define MSG_AP_TUNING_STATUS 0x09
 
+// MSG_ROUTE_START – sent by handheld before chunked route upload.
+//   routeId identifies the handheld-stored route.
+//   totalWaypoints and totalChunks define the expected payload.
+#define MSG_ROUTE_START 0x0A
+
+// MSG_ROUTE_CHUNK – sent by handheld with 1..ROUTE_WAYPOINTS_PER_CHUNK waypoints.
+//   chunkIndex is zero-based and must be contiguous.
+#define MSG_ROUTE_CHUNK 0x0B
+
+// MSG_ROUTE_END – sent by handheld after all route chunks.
+//   crc16 is optional (set 0 if unused).
+#define MSG_ROUTE_END 0x0C
+
+// MSG_ROUTE_CONTROL – sent by handheld to start/stop execution.
+//   action uses ROUTE_ACTION_* constants below.
+#define MSG_ROUTE_CONTROL 0x0D
+
+// MSG_ROUTE_STATUS – broadcast by navigation for route upload/run state.
+//   state uses ROUTE_STATE_* constants below.
+#define MSG_ROUTE_STATUS 0x0E
+
+// MSG_WAYPOINT_REACHED – broadcast by navigation when advancing to next waypoint.
+#define MSG_WAYPOINT_REACHED 0x0F
+
+// MSG_ROUTE_COMPLETE – broadcast by navigation when final waypoint is reached.
+#define MSG_ROUTE_COMPLETE 0x10
+
+// MSG_ROUTE_ABORT – broadcast by navigation when route execution aborts.
+//   reason uses ROUTE_ABORT_* constants below.
+#define MSG_ROUTE_ABORT 0x11
+
 // Parameter IDs for MSG_AP_TUNING
 #define AP_PARAM_KP         0
 #define AP_PARAM_KI         1
@@ -89,6 +120,34 @@
 #define AP_PARAM_MAX_OUTPUT 3
 #define AP_PARAM_DEADBAND   4
 #define AP_PARAM_RATE_LIMIT 5
+
+// Route limits for first implementation.
+#define ROUTE_MAX_ROUTES               10
+#define ROUTE_MAX_WAYPOINTS_PER_ROUTE  50
+#define ROUTE_WAYPOINTS_PER_CHUNK      4
+#define ROUTE_DEFAULT_RADIUS_M         5
+
+// ROUTE_ACTION_* for MSG_ROUTE_CONTROL.
+#define ROUTE_ACTION_START 1
+#define ROUTE_ACTION_STOP  2
+
+// ROUTE_STATE_* for MSG_ROUTE_STATUS.
+#define ROUTE_STATE_IDLE       0
+#define ROUTE_STATE_UPLOADING  1
+#define ROUTE_STATE_READY      2
+#define ROUTE_STATE_RUNNING    3
+#define ROUTE_STATE_ABORTED    4
+#define ROUTE_STATE_COMPLETE   5
+
+// ROUTE_ABORT_* for MSG_ROUTE_ABORT.
+#define ROUTE_ABORT_NONE            0
+#define ROUTE_ABORT_BAD_FORMAT      1
+#define ROUTE_ABORT_BAD_SEQUENCE    2
+#define ROUTE_ABORT_BAD_WAYPOINT    3
+#define ROUTE_ABORT_NO_GPS_FIX      4
+#define ROUTE_ABORT_NO_HEADING      5
+#define ROUTE_ABORT_STOP_REQUESTED  6
+#define ROUTE_ABORT_EMPTY_ROUTE     7
 
 // ---------------------------------------------------------------------------
 // Button bitmask flags used in ControllerInputMessage.buttons
@@ -145,6 +204,79 @@ struct NavigationMessage {
     float    course;    // GPS course over ground in degrees [0, 360)
     float    heading;   // magnetic compass heading in degrees [0, 360)
 };  // 24 bytes
+
+// Fixed-point waypoint for deterministic transfer and storage.
+// latE7/lonE7 are degrees scaled by 1e7 (WGS84), radius in meters.
+struct WaypointData {
+    int32_t  latE7;
+    int32_t  lonE7;
+    uint16_t radiusM;
+};  // 10 bytes
+
+struct RouteStartMessage {
+    uint8_t  type;           // MSG_ROUTE_START
+    uint8_t  src;            // MODULE_HANDHELD
+    uint8_t  routeId;        // [0, ROUTE_MAX_ROUTES)
+    uint8_t  totalWaypoints; // [1, ROUTE_MAX_WAYPOINTS_PER_ROUTE]
+    uint8_t  totalChunks;    // ceil(totalWaypoints / ROUTE_WAYPOINTS_PER_CHUNK)
+    uint8_t  reserved;
+};  // 6 bytes
+
+struct RouteChunkMessage {
+    uint8_t      type;          // MSG_ROUTE_CHUNK
+    uint8_t      src;           // MODULE_HANDHELD
+    uint8_t      routeId;
+    uint8_t      chunkIndex;    // zero-based
+    uint8_t      waypointCount; // 1..ROUTE_WAYPOINTS_PER_CHUNK
+    uint8_t      reserved;
+    WaypointData waypoints[ROUTE_WAYPOINTS_PER_CHUNK];
+};  // 46 bytes
+
+struct RouteEndMessage {
+    uint8_t  type;      // MSG_ROUTE_END
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  routeId;
+    uint8_t  reserved;
+    uint16_t crc16;     // optional; can be 0 in v1
+};  // 6 bytes
+
+struct RouteControlMessage {
+    uint8_t  type;      // MSG_ROUTE_CONTROL
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  action;    // ROUTE_ACTION_*
+    uint8_t  routeId;
+};  // 4 bytes
+
+struct RouteStatusMessage {
+    uint8_t  type;          // MSG_ROUTE_STATUS
+    uint8_t  src;           // MODULE_NAVIGATION
+    uint8_t  routeId;
+    uint8_t  state;         // ROUTE_STATE_*
+    uint8_t  currentIndex;  // [0, totalWaypoints)
+    uint8_t  totalWaypoints;
+    uint16_t distanceM;     // distance to current waypoint when running
+};  // 8 bytes
+
+struct WaypointReachedMessage {
+    uint8_t  type;          // MSG_WAYPOINT_REACHED
+    uint8_t  src;           // MODULE_NAVIGATION
+    uint8_t  routeId;
+    uint8_t  waypointIndex; // reached waypoint index
+};  // 4 bytes
+
+struct RouteCompleteMessage {
+    uint8_t  type;      // MSG_ROUTE_COMPLETE
+    uint8_t  src;       // MODULE_NAVIGATION
+    uint8_t  routeId;
+    uint8_t  reserved;
+};  // 4 bytes
+
+struct RouteAbortMessage {
+    uint8_t  type;      // MSG_ROUTE_ABORT
+    uint8_t  src;       // MODULE_NAVIGATION
+    uint8_t  routeId;
+    uint8_t  reason;    // ROUTE_ABORT_*
+};  // 4 bytes
 #pragma pack(pop)
 
 // Broadcast MAC address – send here to reach every ESP-NOW peer at once.
