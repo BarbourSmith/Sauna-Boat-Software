@@ -758,7 +758,7 @@ static void handleSerialCommand(char* line) {
     Serial.printf("$ERR,%s,unknown command\n", name);
 }
 
-static void processSerialInput() {
+static void processSerialInput(unsigned long now) {
     while (Serial.available() > 0) {
         int ch = Serial.read();
         if (ch < 0) break;
@@ -775,7 +775,9 @@ static void processSerialInput() {
 
         g_serialLine[g_serialLineLen] = '\0';
         if (g_serialLine[0] == '$') {
-            g_lastActivityMs = millis();
+            // Use loop()'s `now`: a later millis() would make the idle check's
+            // `now - g_lastActivityMs` wrap around and trigger deep sleep.
+            g_lastActivityMs = now;
             if (g_serialLineOverflow) {
                 Serial.println("$ERR,LINE,line too long");
             } else {
@@ -1841,7 +1843,7 @@ void loop() {
 
     JoystickReading joy = readJoystick();
     handleMenuInput(joy, now);
-    processSerialInput();
+    processSerialInput(now);
     processRouteTransfer(now);
 
     // Activity detection: any deflection or button press resets the idle timer.
