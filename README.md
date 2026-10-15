@@ -13,6 +13,8 @@ message, and any other module can listen and act on it.
 .
 ├── shared/
 │   └── mesh_protocol.h     ← inter-module message definitions (included by all modules)
+├── tools/
+│   └── route_planner/      ← web route planner (GitHub Pages); uploads routes over USB
 └── modules/
     ├── steering/            ← ESP32-S3 on Maslow 4 board; drives the rudder motor
     │   ├── platformio.ini
@@ -88,11 +90,60 @@ bool in the `settings` Preferences namespace.
 | Joystick VRy            | 5  | ADC1_CH4 |
 | Joystick SW             | 6  | INPUT_PULLUP, active LOW |
 
+**Routes:** stores up to 10 routes of up to 50 waypoints in NVS. Routes can
+be recorded on the device (Navigation → Routes → Append current) or planned
+on a map with the [route planner](#route-planner) and uploaded over USB.
+"Send + Start" sends the active route to the navigation module.
+
 **Build & flash:**
 ```bash
 cd modules/handheld_controller
 pio run -t upload
 ```
+
+---
+
+## Route planner
+
+`tools/route_planner/` is a static web app, published to GitHub Pages by
+`.github/workflows/route-planner-pages.yml` on every push to `main` that
+touches it (one-time setup: repo **Settings → Pages → Source: GitHub
+Actions**). Once deployed it lives at
+<https://barboursmith.github.io/Sauna-Boat-Software/>.
+
+- Shows all 10 controller route slots on an OpenStreetMap / satellite map
+  with OpenSeaMap sea marks.
+- Click the map to add waypoints, drag to move, click a **+** between two
+  points to insert one; set each waypoint's arrival radius (1–100 m).
+- Plug the handheld into a computer with USB and press **Connect
+  controller** (Chrome or Edge on desktop — it uses the Web Serial API).
+  The planner reads every route, shows which have unsaved changes, uploads
+  them (verified by reading back), and can set the active route. While
+  connected it also shows the boat's live GPS position.
+- Works offline too: routes are kept in the browser until uploaded, and can
+  be imported/exported as GPX (long GPX tracks are simplified to 50 points).
+- Open the page with `?sim` to try it against a simulated controller.
+
+To run it locally: `python3 -m http.server 8000 --bind 127.0.0.1 --directory tools/route_planner`
+and open <http://127.0.0.1:8000/> (Web Serial needs `localhost`/`127.0.0.1` or HTTPS).
+
+### USB route protocol
+
+The handheld's USB serial port (115200 baud) carries a line protocol alongside
+its debug log; protocol lines start with `$`. The full command list is in the
+"USB serial route protocol" section of `modules/handheld_controller/src/main.cpp`.
+For example, from `pio device monitor`:
+
+```
+$HELLO        → $HELLO,SAUNA_HANDHELD,1,10,50,1,100,15,0
+$GET,0        → $ROUTE,0,2,Harbor loop
+                $WP,0,0,476395000,-1223365000,5
+                $WP,0,1,476440000,-1223345000,8
+                $OK,GET,0
+```
+
+Uploads are staged (`$PUT` → `$WP`… → `$COMMIT`) and only replace the stored
+route once every waypoint has arrived and validated.
 
 ---
 

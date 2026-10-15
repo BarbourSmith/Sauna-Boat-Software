@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sauna Boat Route Planner</title>
+  <meta name="description" content="Plan GPS waypoint routes on a map and upload them to the Sauna Boat handheld controller over USB." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1b2a'/%3E%3Cpath d='M5 19h22l-3 6H8z' fill='%2300b4d8'/%3E%3Cpath d='M10 19v-6h12v6' fill='none' stroke='%2300b4d8' stroke-width='2'/%3E%3Cpath d='M13 10c0-1.5 1.5-1.5 1.5-3S13 5.5 13 4M18 10c0-1.5 1.5-1.5 1.5-3S18 5.5 18 4' fill='none' stroke='%23e6edf3' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-logo" viewBox="0 0 24 24"><path d="M3 14h18l-2.5 5h-13z" fill="currentColor" stroke="none"/><path d="M7 14V9.5h10V14"/><path d="M10 7c0-1.2 1.2-1.2 1.2-2.4S10 3.4 10 2.2M14 7c0-1.2 1.2-1.2 1.2-2.4S14 3.4 14 2.2"/></symbol>
+      <symbol id="i-plug" viewBox="0 0 24 24"><path d="M12 22v-5M9 8V2M15 8V2M18 8v4a6 6 0 0 1-12 0V8z"/></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5M12 3v12"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></symbol>
+      <symbol id="i-undo" viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/></symbol>
+      <symbol id="i-reverse" viewBox="0 0 24 24"><path d="m8 3-4 4 4 4M4 7h16M16 21l4-4-4-4M20 17H4"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+      <symbol id="i-revert" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+      <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 2 3.1 6.3 6.9 1-5 4.9 1.2 6.8-6.2-3.2L5.8 21 7 14.2 2 9.3l6.9-1z"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+      <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></symbol>
+      <symbol id="i-boat" viewBox="0 0 24 24"><path d="M12 2 19 20l-7-3.5L5 20z" fill="currentColor"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></symbol>
+    </defs>
+  </svg>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="logo"><use href="#i-logo"/></svg>
+      <div class="brand-text">
+        <h1>Route Planner</h1>
+        <span>Sauna Boat</span>
+      </div>
+    </div>
+
+    <form class="search" id="search-form" role="search" autocomplete="off">
+      <svg class="icon"><use href="#i-search"/></svg>
+      <input id="search-input" type="search" placeholder="Find a place…" aria-label="Find a place" />
+      <ul id="search-results" class="search-results" hidden></ul>
+    </form>
+
+    <div class="connection">
+      <span id="sim-chip" class="chip sim" hidden title="Opened with ?sim — talking to an in-browser stand-in, not real hardware">Simulated</span>
+      <span class="status" id="conn-status"><span class="dot"></span><span id="conn-text">Not connected</span></span>
+      <button id="connect-btn" class="btn primary" type="button">
+        <svg class="icon"><use href="#i-plug"/></svg><span>Connect controller</span>
+      </button>
+    </div>
+  </header>
+
+  <div id="serial-unsupported" class="banner" hidden>
+    Connecting to the controller needs Chrome or Edge on a desktop computer. You can still plan routes
+    here — they're kept in this browser — and export them as GPX.
+  </div>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="routes">
+        <div class="section-head">
+          <h2>Routes</h2>
+          <div class="section-actions">
+            <button id="upload-all-btn" class="btn small" type="button" hidden>
+              <svg class="icon"><use href="#i-upload"/></svg>Upload all changes
+            </button>
+            <button id="new-route-btn" class="btn small" type="button">
+              <svg class="icon"><use href="#i-plus"/></svg>New route
+            </button>
+          </div>
+        </div>
+        <ul id="route-list" class="route-list"></ul>
+        <p id="slots-note" class="note"></p>
+      </section>
+
+      <section class="editor" id="editor">
+        <div class="editor-head">
+          <span class="slot-badge large" id="editor-slot" title="Slot number on the controller">1</span>
+          <input id="route-name" class="name-input" type="text" spellcheck="false" aria-label="Route name" />
+        </div>
+        <div class="editor-meta">
+          <span id="route-stats" class="stats"></span>
+          <span id="editor-badges" class="badges"></span>
+        </div>
+
+        <div class="actions">
+          <button id="upload-btn" class="btn primary" type="button">
+            <svg class="icon"><use href="#i-upload"/></svg><span>Upload to controller</span>
+          </button>
+          <button id="active-btn" class="btn" type="button"
+                  title="The controller's “Send + Start” menu item runs the active route">
+            <svg class="icon"><use href="#i-star"/></svg><span>Make active</span>
+          </button>
+          <button id="revert-btn" class="btn ghost" type="button" title="Discard local changes and use the copy stored on the controller">
+            <svg class="icon"><use href="#i-revert"/></svg><span>Revert</span>
+          </button>
+        </div>
+
+        <div class="tools">
+          <button id="undo-btn" class="tool" type="button" title="Undo (Ctrl+Z)"><svg class="icon"><use href="#i-undo"/></svg>Undo</button>
+          <button id="reverse-btn" class="tool" type="button" title="Reverse the waypoint order"><svg class="icon"><use href="#i-reverse"/></svg>Reverse</button>
+          <button id="import-btn" class="tool" type="button" title="Load a route, track or waypoints from a GPX file"><svg class="icon"><use href="#i-download"/></svg>Import GPX</button>
+          <button id="export-btn" class="tool" type="button" title="Save this route as a GPX file"><svg class="icon"><use href="#i-upload"/></svg>Export GPX</button>
+          <button id="delete-btn" class="tool danger" type="button" title="Remove every waypoint and reset the name"><svg class="icon"><use href="#i-trash"/></svg>Delete</button>
+          <input id="import-input" type="file" accept=".gpx,application/gpx+xml,application/xml,text/xml" hidden />
+        </div>
+
+        <p class="hint" id="editor-hint"></p>
+        <ol class="wp-list" id="wp-list"></ol>
+      </section>
+
+      <details class="log" id="log">
+        <summary><svg class="icon"><use href="#i-terminal"/></svg>Controller log</summary>
+        <pre id="log-output">Nothing yet — connect the controller to see its serial output.</pre>
+      </details>
+    </aside>
+
+    <div id="map" class="map" aria-label="Route map"></div>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+    <span id="toast-text"></span>
+    <button id="toast-action" type="button" hidden></button>
+  </div>
+</body>
+</html>

@@ -80,7 +80,7 @@ constexpr unsigned long MENU_BTN_DEBOUNCE_MS = 180;
 // Sleep timeout — enter deep sleep after this much idle (no stick / button).
 // ---------------------------------------------------------------------------
 constexpr bool DISABLE_SLEEP_FOR_DEBUG = false;         // keep false for normal operation
-constexpr unsigned long IDLE_SLEEP_MS = 60UL * 1000UL;  // 1 minute
+constexpr unsigned long IDLE_SLEEP_MS = 180UL * 1000UL; // 3 minutes
 
 // ---------------------------------------------------------------------------
 // OLED — SSD1306 128x64 over I2C, default address 0x3C
@@ -116,6 +116,13 @@ static bool         g_navHoldActive    = false;
 static float        g_navHoldTarget    = NAN;
 static float        g_navSteerCmd      = NAN;
 static unsigned long g_lastNavSteerMs  = 0;
+
+// Route execution status broadcast by the navigation module.
+static uint8_t      g_navRouteState        = ROUTE_STATE_IDLE;
+static uint8_t      g_navRouteCurrentIndex = 0;
+static uint8_t      g_navRouteTotal        = 0;
+static uint16_t     g_navRouteDistanceM    = 0;
+static unsigned long g_lastRouteStatusMs   = 0;
 
 static float        g_steeringAngle    = NAN;
 static float        g_steeringTarget   = NAN;
@@ -533,6 +540,254 @@ static void processRouteTransfer(unsigned long now) {
 }
 
 // ---------------------------------------------------------------------------
+// USB serial route protocol
+// ---------------------------------------------------------------------------
+// Line-based protocol used by the web route planner (tools/route_planner) to
+// read and write the stored routes over the USB port. Every protocol line
+// starts with '$' so it can share the port with the debug log; the host
+// ignores any line that doesn't. Fields are comma-separated and a route name,
+// when present, is always the last field.
+//
+//   $HELLO                    -> $HELLO,SAUNA_HANDHELD,<ver>,<routes>,<maxWps>,
+//                                       <radiusMin>,<radiusMax>,<nameLen>,<activeId>
+//   $GET,<id>                 -> $ROUTE,<id>,<count>,<name>
+//                                $WP,<id>,<idx>,<latE7>,<lonE7>,<radiusM>  (x count)
+//                                $OK,GET,<id>
+//   $PUT,<id>,<count>,<name>  -> $OK,PUT,<id>      start staging a replacement
+//   $WP,<id>,<idx>,<latE7>,<lonE7>,<radiusM>
+//                             -> $OK,WP,<idx>      idx must be sequential
+//   $COMMIT,<id>              -> $OK,COMMIT,<id>   store staged route in NVS
+//   $ACTIVE,<id>              -> $OK,ACTIVE,<id>   route used by "Send + Start"
+//   $POS                      -> $POS,<fixType>,<latE7>,<lonE7>,<heading|-1>
+//   $PING                     -> $OK,PING
+//
+// Failures reply $ERR,<CMD>,<reason>. Any command counts as user activity so
+// the controller stays awake while the planner is connected.
+static constexpr uint8_t SERIAL_PROTOCOL_VERSION = 1;
+
+static char   g_serialLine[128];
+static size_t g_serialLineLen      = 0;
+static bool   g_serialLineOverflow = false;
+
+// Route being received over USB. It only replaces g_routes[] on $COMMIT, so
+// an interrupted upload never leaves a half-written route behind.
+static bool       g_serialPutActive   = false;
+static uint8_t    g_serialPutId       = 0;
+static uint8_t    g_serialPutExpected = 0;
+static RouteStore g_serialPutRoute    = {};
+static char       g_serialPutName[16] = {};
+
+// Splits `line` in place on commas into at most maxFields fields. The last
+// field keeps any remaining commas. Returns the number of fields found.
+static int splitFields(char* line, char** fields, int maxFields) {
+    int n = 0;
+    char* p = line;
+    while (p && n < maxFields) {
+        fields[n++] = p;
+        if (n == maxFields) break;
+        char* comma = strchr(p, ',');
+        if (comma) *comma++ = '\0';
+        p = comma;
+    }
+    return n;
+}
+
+static bool parseLongField(const char* s, long minVal, long maxVal, long* out) {
+    if (!s || *s == '\0') return false;
+    char* end = nullptr;
+    long v = strtol(s, &end, 10);
+    if (*end != '\0' || v < minVal || v > maxVal) return false;
+    *out = v;
+    return true;
+}
+
+// Copies a host-supplied route name, replacing non-printable characters and
+// trimming trailing spaces. Empty result means "use the default name".
+static void sanitizeRouteName(const char* in, char* out, size_t outSize) {
+    size_t n = 0;
+    for (; *in && n < outSize - 1; ++in) {
+        char ch = *in;
+        out[n++] = (ch >= 0x20 && ch <= 0x7E) ? ch : ' ';
+    }
+    while (n > 0 && out[n - 1] == ' ') --n;
+    out[n] = '\0';
+}
+
+static void handleSerialCommand(char* line) {
+    char* cmd = line;
+    char* args = strchr(line, ',');
+    if (args) *args++ = '\0';
+    const char* name = cmd + 1;  // command name without the leading '$'
+    char* f[5] = {};
+
+    if (strcmp(cmd, "$HELLO") == 0) {
+        Serial.printf("$HELLO,SAUNA_HANDHELD,%u,%u,%u,%u,%u,%u,%u\n",
+                      (unsigned)SERIAL_PROTOCOL_VERSION,
+                      (unsigned)ROUTE_MAX_ROUTES,
+                      (unsigned)ROUTE_MAX_WAYPOINTS_PER_ROUTE,
+                      (unsigned)ROUTE_RADIUS_MIN_M,
+                      (unsigned)ROUTE_RADIUS_MAX_M,
+                      (unsigned)(sizeof(g_routeNames[0]) - 1),
+                      (unsigned)g_activeRouteId);
+        return;
+    }
+
+    if (strcmp(cmd, "$PING") == 0) {
+        Serial.println("$OK,PING");
+        return;
+    }
+
+    if (strcmp(cmd, "$POS") == 0) {
+        unsigned long now = millis();
+        bool fix = hasFreshNavFix(now);
+        bool linkOk = (g_lastNavMs != 0) && (now - g_lastNavMs < 2000);
+        Serial.printf("$POS,%u,%ld,%ld,%.1f\n",
+                      (unsigned)(fix ? g_navFixType : 0),
+                      fix ? (long)lroundf(g_navLat * 10000000.0f) : 0L,
+                      fix ? (long)lroundf(g_navLon * 10000000.0f) : 0L,
+                      (linkOk && !isnan(g_navHeading)) ? g_navHeading : -1.0f);
+        return;
+    }
+
+    if (strcmp(cmd, "$GET") == 0) {
+        long id;
+        if (splitFields(args, f, 1) < 1 || !parseLongField(f[0], 0, ROUTE_MAX_ROUTES - 1, &id)) {
+            Serial.println("$ERR,GET,bad route id");
+            return;
+        }
+        const RouteStore& route = g_routes[id];
+        Serial.printf("$ROUTE,%ld,%u,%s\n", id, (unsigned)route.count, g_routeNames[id]);
+        for (uint8_t i = 0; i < route.count; ++i) {
+            const WaypointData& wp = route.points[i];
+            Serial.printf("$WP,%ld,%u,%ld,%ld,%u\n", id, (unsigned)i,
+                          (long)wp.latE7, (long)wp.lonE7, (unsigned)wp.radiusM);
+        }
+        Serial.printf("$OK,GET,%ld\n", id);
+        return;
+    }
+
+    if (strcmp(cmd, "$PUT") == 0) {
+        long id, count;
+        int n = splitFields(args, f, 3);
+        if (n < 2 || !parseLongField(f[0], 0, ROUTE_MAX_ROUTES - 1, &id) ||
+            !parseLongField(f[1], 0, ROUTE_MAX_WAYPOINTS_PER_ROUTE, &count)) {
+            Serial.println("$ERR,PUT,bad route id or waypoint count");
+            return;
+        }
+        g_serialPutActive   = true;
+        g_serialPutId       = (uint8_t)id;
+        g_serialPutExpected = (uint8_t)count;
+        g_serialPutRoute.count = 0;
+        sanitizeRouteName(n >= 3 ? f[2] : "", g_serialPutName, sizeof(g_serialPutName));
+        Serial.printf("$OK,PUT,%ld\n", id);
+        return;
+    }
+
+    if (strcmp(cmd, "$WP") == 0) {
+        long id, idx, latE7, lonE7, radius;
+        if (!g_serialPutActive) {
+            Serial.println("$ERR,WP,no upload in progress");
+            return;
+        }
+        if (splitFields(args, f, 5) < 5 ||
+            !parseLongField(f[0], 0, ROUTE_MAX_ROUTES - 1, &id) ||
+            !parseLongField(f[1], 0, ROUTE_MAX_WAYPOINTS_PER_ROUTE - 1, &idx) ||
+            !parseLongField(f[2], -900000000L, 900000000L, &latE7) ||
+            !parseLongField(f[3], -1800000000L, 1800000000L, &lonE7) ||
+            !parseLongField(f[4], ROUTE_RADIUS_MIN_M, ROUTE_RADIUS_MAX_M, &radius)) {
+            Serial.println("$ERR,WP,bad waypoint");
+            return;
+        }
+        if (id != g_serialPutId || idx != g_serialPutRoute.count || idx >= g_serialPutExpected) {
+            Serial.printf("$ERR,WP,expected waypoint %u of route %u\n",
+                          (unsigned)g_serialPutRoute.count, (unsigned)g_serialPutId);
+            return;
+        }
+        WaypointData& wp = g_serialPutRoute.points[g_serialPutRoute.count++];
+        wp.latE7   = (int32_t)latE7;
+        wp.lonE7   = (int32_t)lonE7;
+        wp.radiusM = (uint16_t)radius;
+        Serial.printf("$OK,WP,%ld\n", idx);
+        return;
+    }
+
+    if (strcmp(cmd, "$COMMIT") == 0) {
+        long id;
+        if (splitFields(args, f, 1) < 1 || !parseLongField(f[0], 0, ROUTE_MAX_ROUTES - 1, &id) ||
+            !g_serialPutActive || id != g_serialPutId) {
+            Serial.println("$ERR,COMMIT,no upload in progress for that route");
+            return;
+        }
+        if (g_serialPutRoute.count != g_serialPutExpected) {
+            Serial.printf("$ERR,COMMIT,received %u of %u waypoints\n",
+                          (unsigned)g_serialPutRoute.count, (unsigned)g_serialPutExpected);
+            return;
+        }
+        if (g_routeTxStage != RouteTxStage::IDLE && g_routeTxRouteId == id) {
+            Serial.println("$ERR,COMMIT,route is being sent to the boat");
+            return;
+        }
+        g_routes[id] = g_serialPutRoute;
+        if (g_serialPutName[0] != '\0') {
+            snprintf(g_routeNames[id], sizeof(g_routeNames[id]), "%s", g_serialPutName);
+        } else {
+            setDefaultRouteName((uint8_t)id, g_routeNames[id], sizeof(g_routeNames[id]));
+        }
+        g_serialPutActive = false;
+        clampSelectedWaypoint();
+        saveRoutesToNVS();
+        setRouteNotice("Route saved (USB)");
+        Serial.printf("$OK,COMMIT,%ld\n", id);
+        return;
+    }
+
+    if (strcmp(cmd, "$ACTIVE") == 0) {
+        long id;
+        if (splitFields(args, f, 1) < 1 || !parseLongField(f[0], 0, ROUTE_MAX_ROUTES - 1, &id)) {
+            Serial.println("$ERR,ACTIVE,bad route id");
+            return;
+        }
+        g_activeRouteId = (uint8_t)id;
+        clampSelectedWaypoint();
+        saveRoutesToNVS();
+        setRouteNotice("Route selected");
+        Serial.printf("$OK,ACTIVE,%ld\n", id);
+        return;
+    }
+
+    Serial.printf("$ERR,%s,unknown command\n", name);
+}
+
+static void processSerialInput() {
+    while (Serial.available() > 0) {
+        int ch = Serial.read();
+        if (ch < 0) break;
+        if (ch == '\r') continue;
+
+        if (ch != '\n') {
+            if (g_serialLineLen < sizeof(g_serialLine) - 1) {
+                g_serialLine[g_serialLineLen++] = (char)ch;
+            } else {
+                g_serialLineOverflow = true;
+            }
+            continue;
+        }
+
+        g_serialLine[g_serialLineLen] = '\0';
+        if (g_serialLine[0] == '$') {
+            g_lastActivityMs = millis();
+            if (g_serialLineOverflow) {
+                Serial.println("$ERR,LINE,line too long");
+            } else {
+                handleSerialCommand(g_serialLine);
+            }
+        }
+        g_serialLineLen = 0;
+        g_serialLineOverflow = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Battery
 // ---------------------------------------------------------------------------
 static void readBatteryVoltage() {
@@ -699,6 +954,18 @@ static void onDataRecv(const uint8_t* /*mac*/,
         if (m.src != MODULE_NAVIGATION) return;
         g_navHoldActive = (m.value1 > 0.5f);
         g_navHoldTarget = g_navHoldActive ? m.value2 : NAN;
+        return;
+    }
+
+    if (type == MSG_ROUTE_STATUS && len >= (int)sizeof(RouteStatusMessage)) {
+        RouteStatusMessage m;
+        memcpy(&m, data, sizeof(m));
+        if (m.src != MODULE_NAVIGATION) return;
+        g_navRouteState        = m.state;
+        g_navRouteCurrentIndex = m.currentIndex;
+        g_navRouteTotal        = m.totalWaypoints;
+        g_navRouteDistanceM    = m.distanceM;
+        g_lastRouteStatusMs    = millis();
         return;
     }
 
@@ -1182,7 +1449,16 @@ static void drawDisplay(const JoystickReading& joy) {
     }
 
     display.setCursor(0, 38);
-    if (g_navHoldActive && !isnan(g_navHoldTarget)) {
+    bool routeRunning = (g_navRouteState == ROUTE_STATE_RUNNING)
+                        && (g_lastRouteStatusMs != 0)
+                        && (millis() - g_lastRouteStatusMs < 3000);
+    if (routeRunning && g_navRouteTotal > 0) {
+        // During waypoint navigation, show current waypoint and distance to it.
+        display.printf("WP %u/%u %um",
+                       (unsigned)(g_navRouteCurrentIndex + 1),
+                       (unsigned)g_navRouteTotal,
+                       (unsigned)g_navRouteDistanceM);
+    } else if (g_navHoldActive && !isnan(g_navHoldTarget)) {
         display.printf("HOLD %5.1f", g_navHoldTarget);
     } else {
         display.print(F("HOLD ---"));
@@ -1565,6 +1841,7 @@ void loop() {
 
     JoystickReading joy = readJoystick();
     handleMenuInput(joy, now);
+    processSerialInput();
     processRouteTransfer(now);
 
     // Activity detection: any deflection or button press resets the idle timer.
