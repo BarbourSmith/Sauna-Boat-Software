@@ -73,6 +73,7 @@ constexpr unsigned long SEND_INTERVAL_MS    = 50;    // 20 Hz mesh broadcast
 constexpr unsigned long DISPLAY_INTERVAL_MS = 100;   // 10 Hz OLED refresh
 constexpr unsigned long BATTERY_INTERVAL_MS = 5000;
 constexpr unsigned long LOG_INTERVAL_MS     = 1000;
+constexpr unsigned long NAV_LINK_TIMEOUT_MS = 2000;  // nav broadcasts every 500 ms; silent this long = offline
 constexpr unsigned long MENU_NAV_REPEAT_MS  = 220;
 constexpr unsigned long MENU_BTN_DEBOUNCE_MS = 180;
 
@@ -416,10 +417,14 @@ static void loadRoutesFromNVS() {
     clampSelectedWaypoint();
 }
 
+// True while MSG_NAV_STATUS is still arriving from the navigation module.
+static bool navLinkOk(unsigned long now) {
+    return (g_lastNavMs != 0) && (now - g_lastNavMs < NAV_LINK_TIMEOUT_MS);
+}
+
 static bool hasFreshNavFix(unsigned long now) {
-    bool fresh = (g_lastNavMs != 0) && (now - g_lastNavMs < 2000);
     bool valid = g_navFixType > 0 && !isnan(g_navLat) && !isnan(g_navLon);
-    return fresh && valid;
+    return navLinkOk(now) && valid;
 }
 
 static void appendCurrentLocationToActiveRoute(unsigned long now) {
@@ -640,7 +645,7 @@ static void handleSerialCommand(char* line) {
     if (strcmp(cmd, "$POS") == 0) {
         unsigned long now = millis();
         bool fix = hasFreshNavFix(now);
-        bool linkOk = (g_lastNavMs != 0) && (now - g_lastNavMs < 2000);
+        bool linkOk = navLinkOk(now);
         Serial.printf("$POS,%u,%ld,%ld,%.1f\n",
                       (unsigned)(fix ? g_navFixType : 0),
                       fix ? (long)lroundf(g_navLat * 10000000.0f) : 0L,
@@ -1353,20 +1358,29 @@ static void drawDisplay(const JoystickReading& joy) {
         if (g_menuScreen == MenuScreen::NAV_INFO) {
             display.setCursor(0, 0);
             display.println(F("Nav Info"));
+            bool navOnline = navLinkOk(millis());
+            if (!navOnline) {
+                display.setCursor(OLED_WIDTH - 6 * 7, 0);
+                display.print(F("OFFLINE"));
+            }
             display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+            // While offline, don't show the last values as if they were live.
             display.setCursor(0, 14);
-            display.printf("Sat: %u", g_navSatellites);
+            if (navOnline) display.printf("Sat: %u", g_navSatellites);
+            else           display.print(F("Sat: -"));
             display.setCursor(64, 14);
-            display.printf("Fix: %u", g_navFixType);
+            if (navOnline) display.printf("Fix: %u", g_navFixType);
+            else           display.print(F("Fix: -"));
             display.setCursor(0, 24);
-            if (!isnan(g_navHeading)) display.printf("HDG: %5.1f", g_navHeading);
-            else                      display.print(F("HDG: ---"));
+            if (!navOnline)                display.print(F("HDG: ---"));
+            else if (!isnan(g_navHeading)) display.printf("HDG: %5.1f", g_navHeading);
+            else                           display.print(F("HDG: no compass"));
             display.setCursor(0, 34);
-            if (!isnan(g_navCourse)) display.printf("COG: %5.1f", g_navCourse);
-            else                     display.print(F("COG: ---"));
+            if (navOnline && !isnan(g_navCourse)) display.printf("COG: %5.1f", g_navCourse);
+            else                                  display.print(F("COG: ---"));
             display.setCursor(0, 44);
-            if (!isnan(g_navSpeedKnots)) display.printf("SOG: %4.1fkn", g_navSpeedKnots);
-            else                         display.print(F("SOG: ---"));
+            if (navOnline && !isnan(g_navSpeedKnots)) display.printf("SOG: %4.1fkn", g_navSpeedKnots);
+            else                                      display.print(F("SOG: ---"));
             display.setCursor(0, 54);
             display.println(F("Click: Back"));
             display.display();
@@ -1433,15 +1447,26 @@ static void drawDisplay(const JoystickReading& joy) {
     display.setCursor(0, 0);
     display.printf("Bat %3d%% %4.2fV", g_batteryPercent, g_batteryVoltage);
     display.setCursor(96, 0);
-    bool linkOk = (g_lastNavMs != 0) && (millis() - g_lastNavMs < 2000);
+    bool linkOk = navLinkOk(millis());
     display.print(linkOk ? F(" LNK") : F("  --"));
 
     display.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
 
-    // Heading status.
+    // Nav status. Offline means nothing is arriving from the nav module;
+    // otherwise show what it reports, including missing sensors.
     display.setCursor(0, 14);
-    if (!isnan(g_navHeading)) display.printf("HDG %5.1f", g_navHeading);
-    else                      display.print(F("HDG  ---"));
+    if (!linkOk) {
+        display.print(F("NAV OFFLINE"));
+    } else {
+        if (!isnan(g_navHeading)) display.printf("HDG %5.1f", g_navHeading);
+        else                      display.print(F("HDG NO COMPASS"));
+
+        char gpsText[8];
+        if (g_navFixType > 0) snprintf(gpsText, sizeof(gpsText), "GPS %u", (unsigned)g_navSatellites);
+        else                  snprintf(gpsText, sizeof(gpsText), "NO GPS");
+        display.setCursor(OLED_WIDTH - 6 * (int)strlen(gpsText), 14);
+        display.print(gpsText);
+    }
 
     display.setCursor(0, 26);
     if (g_lastNavSteerMs != 0 && (millis() - g_lastNavSteerMs) < 2000 && !isnan(g_navSteerCmd)) {
@@ -1460,7 +1485,7 @@ static void drawDisplay(const JoystickReading& joy) {
                        (unsigned)(g_navRouteCurrentIndex + 1),
                        (unsigned)g_navRouteTotal,
                        (unsigned)g_navRouteDistanceM);
-    } else if (g_navHoldActive && !isnan(g_navHoldTarget)) {
+    } else if (linkOk && g_navHoldActive && !isnan(g_navHoldTarget)) {
         display.printf("HOLD %5.1f", g_navHoldTarget);
     } else {
         display.print(F("HOLD ---"));

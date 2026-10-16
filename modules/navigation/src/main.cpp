@@ -526,7 +526,9 @@ static void broadcastNavStatus() {
     msg.type = MSG_NAV_STATUS;
     msg.src  = MODULE_NAVIGATION;
 
-    if (gps.location.isValid()) {
+    // TinyGPS keeps isValid() true after the fix is lost (or the GPS stops
+    // talking), so also require a recent update.
+    if (gps.location.isValid() && gps.location.age() <= ROUTE_GPS_STALE_MS) {
         msg.fixType    = 1;
         msg.lat        = (float)gps.location.lat();
         msg.lon        = (float)gps.location.lng();
