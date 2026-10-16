@@ -434,7 +434,9 @@
       }
 
       // Heading value
-      document.getElementById('hdg-value').textContent = d.hdg.toFixed(1) + '\u00B0';
+      document.getElementById('hdg-value').textContent = d.magOk === false
+        ? 'No compass'
+        : d.hdg.toFixed(1) + '\u00B0';
 
       // Autopilot sub-text
       var sub = document.getElementById('hdg-sub');

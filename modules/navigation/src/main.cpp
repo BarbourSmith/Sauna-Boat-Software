@@ -13,6 +13,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
+#include <esp_system.h>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
@@ -28,6 +29,8 @@
 #define GPS_TX_PIN  17   // ESP32 UART2 TX → NEO-6M RX
 #define GPS_BAUD    9600 // NEO-6M default baud rate
 
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
 #define BMM150_I2C_ADDR  0x13  // BMM150 default I2C address
 
 // ---------------------------------------------------------------------------
@@ -51,6 +54,10 @@ static constexpr float         STICK_OVERRIDE_EXIT  = 0.10f; // remain in manual
 static constexpr unsigned long CTRL_INPUT_TIMEOUT_MS = 1000; // controller input considered stale after this
 static constexpr unsigned long HOLD_RESUME_DELAY_MS = 300; // stick must remain centered this long before hold resumes
 static constexpr unsigned long ROUTE_GPS_STALE_MS = 3000;
+static constexpr unsigned long COMPASS_RETRY_MS     = 1000; // re-init attempt interval while the compass is down
+static constexpr unsigned long COMPASS_TIMEOUT_MS   = 1000; // no valid read for this long → compass lost
+static constexpr unsigned long COMPASS_STALL_MS     = 2000; // no new measurement for this long → compass lost
+static constexpr unsigned long COMPASS_LOST_HOLD_MS = 5000; // release heading hold / abort route after this long without a compass
 
 // ---------------------------------------------------------------------------
 // Heading-hold autopilot tuning (PD controller) — loaded from NVS
@@ -65,8 +72,47 @@ static float g_apRateLimit  = 0.05f;   // max change in output per autopilot tic
 // ---------------------------------------------------------------------------
 // Peripherals
 // ---------------------------------------------------------------------------
+
+// DFRobot's getGeomagneticData() ignores I2C errors and keeps returning
+// plausible-looking numbers when the bus is dead or the sensor has reset
+// itself into suspend mode, so the heading silently freezes. readMag() reads
+// the same registers but reports whether the read actually worked.
+class CheckedBMM150 : public DFRobot_BMM150_I2C {
+public:
+    using DFRobot_BMM150_I2C::DFRobot_BMM150_I2C;
+
+    // Returns false on an I2C error or a sample with no valid data.
+    // newSample is the sensor's data-ready bit: set when it has finished a
+    // measurement since the previous read.
+    bool readMag(sBmm150MagData_t& out, bool& newSample) {
+        uint8_t raw[BMM150_LEN_XYZR_DATA];
+        Wire.beginTransmission(BMM150_I2C_ADDR);
+        Wire.write(BMM150_REG_DATA_X_LSB);
+        if (Wire.endTransmission() != 0) return false;
+        if (Wire.requestFrom((uint8_t)BMM150_I2C_ADDR, (uint8_t)sizeof(raw)) != sizeof(raw)) return false;
+        for (uint8_t& b : raw) b = Wire.read();
+
+        int16_t  x = (int16_t)(((int16_t)(int8_t)raw[1]) * 32  | BMM150_GET_BITS(raw[0], BMM150_DATA_X));
+        int16_t  y = (int16_t)(((int16_t)(int8_t)raw[3]) * 32  | BMM150_GET_BITS(raw[2], BMM150_DATA_Y));
+        int16_t  z = (int16_t)(((int16_t)(int8_t)raw[5]) * 128 | BMM150_GET_BITS(raw[4], BMM150_DATA_Z));
+        uint16_t rhall = (uint16_t)(((uint16_t)raw[7] << 6) | BMM150_GET_BITS(raw[6], BMM150_DATA_RHALL));
+
+        // A suspended (freshly reset) sensor reads back all zeros; the hall
+        // resistance is never zero in a real measurement.
+        if (rhall == 0) return false;
+
+        out.x = compensateX(x, rhall);
+        out.y = compensateY(y, rhall);
+        out.z = compensateZ(z, rhall);
+        if (out.x == BMM150_OVERFLOW_OUTPUT || out.y == BMM150_OVERFLOW_OUTPUT) return false;
+
+        newSample = (raw[6] & BMM150_DRDY_STATUS_MSK) != 0;
+        return true;
+    }
+};
+
 static TinyGPSPlus        gps;
-static DFRobot_BMM150_I2C bmm150(&Wire, BMM150_I2C_ADDR);
+static CheckedBMM150      bmm150(&Wire, BMM150_I2C_ADDR);
 static Preferences        prefs;
 static AsyncWebServer     server(80);
 static AsyncWebSocket     ws("/ws");
@@ -75,7 +121,25 @@ static AsyncWebSocket     ws("/ws");
 // State
 // ---------------------------------------------------------------------------
 static float g_heading = 0.0f;   // magnetic heading in degrees [0, 360)
-static bool  g_bmm150Ok = false; // magnetometer initialised successfully
+static bool  g_bmm150Ok = false; // magnetometer initialised and responding
+
+// Compass health. The sensor is re-initialised whenever reads fail or it
+// stops producing new measurements, instead of needing a power cycle.
+static sBmm150MagData_t g_lastMag = {};
+static unsigned long g_compassLastValidMs = 0;  // last read that returned usable data
+static unsigned long g_compassLastFreshMs = 0;  // last read with the data-ready bit set
+static unsigned long g_compassLastInitMs  = 0;  // last (re)init attempt
+static unsigned long g_compassLastHeadingMs = 0; // last time g_heading was updated from the sensor
+static bool          g_compassDrdyWorks   = false; // data-ready bit seen at least once; arms the stall check
+static bool          g_compassReseed      = true;  // restart the heading filter on the next sample
+static uint32_t      g_compassLostCount   = 0;
+static const char*   g_resetReason        = "";
+
+// True when g_heading is current: the sensor is up and has produced a sample
+// since it was last (re)initialised.
+static bool compassHeadingValid() {
+    return g_bmm150Ok && !g_compassReseed;
+}
 
 // Exponential moving average (EMA) filter for heading.
 static constexpr float HEADING_EMA_ALPHA = 0.15f;
@@ -89,6 +153,7 @@ static float g_calOffsetZ = 0.0f;
 static bool  g_calibrated = false;
 
 // Calibration collection state
+static volatile bool g_calRequested = false; // set by the web UI; started from loop() so I2C stays on one task
 static bool          g_calActive    = false;
 static unsigned long g_calStartTime = 0;
 static float g_calMinX, g_calMaxX;
@@ -186,8 +251,8 @@ static void calSaveToNVS() {
 }
 
 static void calStart() {
-    if (!g_bmm150Ok) {
-        Serial.println("[Cal] ERROR: BMM150 not initialised — cannot calibrate.");
+    if (!compassHeadingValid()) {
+        Serial.println("[Cal] ERROR: BMM150 not responding — cannot calibrate.");
         return;
     }
     Serial.println("[Cal] ========================================");
@@ -196,10 +261,9 @@ static void calStart() {
     Serial.printf( "[Cal]  orientations for %lu seconds…\n", CAL_DURATION_MS / 1000);
     Serial.println("[Cal] ========================================");
 
-    sBmm150MagData_t mag = bmm150.getGeomagneticData();
-    g_calMinX = g_calMaxX = mag.x;
-    g_calMinY = g_calMaxY = mag.y;
-    g_calMinZ = g_calMaxZ = mag.z;
+    g_calMinX = g_calMaxX = g_lastMag.x;
+    g_calMinY = g_calMaxY = g_lastMag.y;
+    g_calMinZ = g_calMaxZ = g_lastMag.z;
 
     g_calStartTime = millis();
     g_calActive    = true;
@@ -236,9 +300,7 @@ static void calFinish() {
 // Compass heading
 // ---------------------------------------------------------------------------
 
-static float readHeading() {
-    sBmm150MagData_t mag = bmm150.getGeomagneticData();
-
+static float headingFromMag(const sBmm150MagData_t& mag) {
     if (g_calActive) {
         calFeedSample(mag.x, mag.y, mag.z);
     }
@@ -254,12 +316,122 @@ static float readHeading() {
     if (rawDeg < 0) rawDeg += 360.0f;
 
     float rawRad = rawDeg * PI / 180.0f;
+    if (g_compassReseed) {
+        // First sample after (re)init: start the filter here rather than
+        // blending from wherever it was before the sensor dropped out.
+        g_compassReseed = false;
+        g_emaSin = sinf(rawRad);
+        g_emaCos = cosf(rawRad);
+    }
     g_emaSin = HEADING_EMA_ALPHA * sinf(rawRad) + (1.0f - HEADING_EMA_ALPHA) * g_emaSin;
     g_emaCos = HEADING_EMA_ALPHA * cosf(rawRad) + (1.0f - HEADING_EMA_ALPHA) * g_emaCos;
 
     float h = atan2f(g_emaSin, g_emaCos) * 180.0f / PI;
     if (h < 0) h += 360.0f;
     return h;
+}
+
+// A reset in the middle of a read can leave the BMM150 holding SDA low while
+// it waits for clock pulses that never come; the bus then stays dead until the
+// sensor loses power. Clock SCL until it lets go, then send a STOP.
+static void i2cBusClear() {
+    pinMode(I2C_SDA_PIN, OUTPUT_OPEN_DRAIN | PULLUP);
+    pinMode(I2C_SCL_PIN, OUTPUT_OPEN_DRAIN | PULLUP);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(10);
+
+    for (int i = 0; i < 18 && digitalRead(I2C_SDA_PIN) == LOW; ++i) {
+        digitalWrite(I2C_SCL_PIN, LOW);
+        delayMicroseconds(10);
+        digitalWrite(I2C_SCL_PIN, HIGH);
+        delayMicroseconds(10);
+    }
+
+    // STOP: SDA rises while SCL is high.
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(10);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delayMicroseconds(10);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    delayMicroseconds(10);
+}
+
+// Tears down the I2C bus, frees it if it is stuck, and brings the BMM150 back
+// up from scratch. Safe to call repeatedly; takes well under a second.
+static bool compassTryInit(unsigned long now) {
+    g_compassLastInitMs = now;
+
+    Wire.end();
+    i2cBusClear();
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    if (bmm150.begin() != 0) return false;
+    bmm150.setOperationMode(BMM150_POWERMODE_NORMAL);
+    bmm150.setPresetMode(BMM150_PRESETMODE_HIGHACCURACY);
+    bmm150.setRate(BMM150_DATA_RATE_30HZ);
+
+    g_bmm150Ok          = true;
+    g_compassReseed     = true;
+    g_compassLastValidMs = now;
+    g_compassLastFreshMs = now;
+    return true;
+}
+
+static void compassMarkLost(const char* why, unsigned long now) {
+    g_bmm150Ok = false;
+    g_compassLastInitMs = now - COMPASS_RETRY_MS;  // retry straight away
+    ++g_compassLostCount;
+    Serial.printf("[Compass] LOST (%s) — reinitialising. Lost %lu time(s) since boot.\n",
+                  why, (unsigned long)g_compassLostCount);
+    if (g_calActive) {
+        // Finishing now would save offsets from too few samples.
+        g_calActive = false;
+        Serial.println("[Cal] Calibration aborted — compass lost. Previous calibration kept.");
+    }
+}
+
+static float headingError(float from, float to);
+
+// Reads the compass and updates g_heading, re-initialising the sensor if it
+// has stopped responding.
+static void updateCompass(unsigned long now) {
+    if (!g_bmm150Ok) {
+        if (now - g_compassLastInitMs < COMPASS_RETRY_MS) return;
+        if (!compassTryInit(now)) return;
+        Serial.println("[Compass] BMM150 initialised (30 Hz, high accuracy).");
+    }
+
+    sBmm150MagData_t mag;
+    bool fresh = false;
+    if (bmm150.readMag(mag, fresh)) {
+        g_compassLastValidMs = now;
+        if (fresh) {
+            g_compassLastFreshMs = now;
+            g_compassDrdyWorks   = true;
+        }
+        // After a re-init, wait for the sensor's first real measurement
+        // before restarting the heading filter from it.
+        if (fresh || !g_compassReseed || !g_compassDrdyWorks) {
+            bool reseeding = g_compassReseed;
+            g_lastMag = mag;
+            g_heading = headingFromMag(mag);
+            g_compassLastHeadingMs = now;
+            if (reseeding) {
+                // Heading may have jumped while the compass was down; don't
+                // let the autopilot see that as a derivative kick.
+                g_prevError     = headingError(g_heading, g_targetHeading);
+                g_prevErrorTime = now;
+            }
+        }
+    }
+
+    if (now - g_compassLastValidMs > COMPASS_TIMEOUT_MS) {
+        compassMarkLost("no valid reads", now);
+    } else if (g_compassDrdyWorks && now - g_compassLastFreshMs > COMPASS_STALL_MS) {
+        compassMarkLost("sensor stopped measuring", now);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +540,9 @@ static void broadcastNavStatus() {
     if (gps.course.isValid()) {
         msg.course = (float)gps.course.deg();
     }
-    if (g_bmm150Ok) {
-        msg.heading = g_heading;
-    }
+    // NaN tells receivers there is no heading (the handheld shows "HDG ---")
+    // rather than a stale or made-up one.
+    msg.heading = compassHeadingValid() ? g_heading : NAN;
 
     esp_now_send(MESH_BROADCAST_ADDR,
                  reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
@@ -490,7 +662,7 @@ static bool startRouteExecution() {
         abortRoute(ROUTE_ABORT_EMPTY_ROUTE);
         return false;
     }
-    if (!g_bmm150Ok) {
+    if (!compassHeadingValid()) {
         abortRoute(ROUTE_ABORT_NO_HEADING);
         return false;
     }
@@ -518,10 +690,9 @@ static void updateRouteGuidance() {
         return;
     }
 
-    if (!g_bmm150Ok) {
-        abortRoute(ROUTE_ABORT_NO_HEADING);
-        return;
-    }
+    // Compass down: pause guidance while it recovers. loop() aborts the route
+    // if it stays down for COMPASS_LOST_HOLD_MS.
+    if (!compassHeadingValid()) return;
 
     if (g_routeCurrentIndex >= g_routeCount) {
         g_routeRunning = false;
@@ -714,6 +885,9 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
 static void buildStatusJson(String& out) {
     float err = headingError(g_heading, g_targetHeading);
     out = "{\"hdg\":";       out += String(g_heading, 1);
+    out += ",\"magOk\":";    out += compassHeadingValid() ? "true" : "false";
+    out += ",\"magLost\":";  out += (unsigned long)g_compassLostCount;
+    out += ",\"reset\":\"";  out += g_resetReason; out += "\"";
     out += ",\"cal\":";      out += g_calibrated ? "true" : "false";
     out += ",\"calActive\":"; out += g_calActive ? "true" : "false";
     if (g_calActive) {
@@ -754,6 +928,21 @@ static void onWsEvent(AsyncWebSocket* /*srv*/, AsyncWebSocketClient* client,
     }
 }
 
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_EXT:       return "reset pin";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "crash";
+        case ESP_RST_INT_WDT:   return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:  return "task watchdog";
+        case ESP_RST_WDT:       return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        default:                return "other";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arduino setup
 // ---------------------------------------------------------------------------
@@ -761,6 +950,8 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== Sauna Boat Navigation Module ===");
+    g_resetReason = resetReasonName(esp_reset_reason());
+    Serial.printf("[Setup] Reset reason: %s\n", g_resetReason);
 
     // --- GPS (UART2) ---
     Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -768,16 +959,13 @@ void setup() {
                   GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
 
     // --- BMM150 (I2C) ---
-    Wire.begin();
-    while (bmm150.begin()) {
-        Serial.println("[Setup] BMM150 not found — retrying in 1 s…");
-        delay(1000);
+    // Don't wait here for the compass: if it's wedged after a reset the mesh
+    // would never come up. loop() keeps retrying until it responds.
+    if (compassTryInit(millis())) {
+        Serial.println("[Setup] BMM150 magnetometer initialised (30 Hz, high accuracy).");
+    } else {
+        Serial.println("[Setup] WARNING: BMM150 not responding — will keep retrying.");
     }
-    bmm150.setOperationMode(BMM150_POWERMODE_NORMAL);
-    bmm150.setPresetMode(BMM150_PRESETMODE_HIGHACCURACY);
-    bmm150.setRate(BMM150_DATA_RATE_30HZ);
-    g_bmm150Ok = true;
-    Serial.println("[Setup] BMM150 magnetometer initialised (30 Hz, high accuracy).");
 
     // --- NVS ---
     prefs.begin("nav", false);
@@ -892,13 +1080,17 @@ void setup() {
         if (g_calActive) {
             request->send(200, "application/json", "{\"ok\":false,\"msg\":\"already running\"}");
         } else {
-            calStart();
+            g_calRequested = true;
             request->send(200, "application/json", "{\"ok\":true}");
         }
     });
 
     server.begin();
     Serial.println("[Setup] HTTP server started.");
+
+    // If loop() ever hangs, reboot (after 5 s) rather than sit dead until
+    // someone power-cycles the module.
+    enableLoopWDT();
 
     Serial.println("[Setup] Navigation module ready.");
     Serial.println("[Setup] Send 'c' over serial to calibrate compass.");
@@ -934,9 +1126,25 @@ void loop() {
         gps.encode(Serial2.read());
     }
 
-    // Update compass heading (also feeds calibration when active).
-    if (g_bmm150Ok) {
-        g_heading = readHeading();
+    // Update compass heading (also feeds calibration when active, and
+    // re-initialises the sensor if it has stopped responding).
+    updateCompass(now);
+
+    if (g_calRequested) {
+        g_calRequested = false;
+        if (!g_calActive) calStart();
+    }
+
+    // While the compass is down the autopilot is paused (see below). If it
+    // doesn't come back, hand control back to the operator.
+    if (g_headingHoldActive && !compassHeadingValid() &&
+        now - g_compassLastHeadingMs >= COMPASS_LOST_HOLD_MS) {
+        Serial.println("[AP] Compass lost — releasing heading hold.");
+        if (g_routeRunning) {
+            abortRoute(ROUTE_ABORT_NO_HEADING);
+        } else {
+            disengageHeadingHold();
+        }
     }
 
     // --- Controller input → heading hold ---
@@ -945,7 +1153,7 @@ void loop() {
         bool upPrev  = (g_prevBtns & CTRL_BTN_UP)   != 0;
         bool dnNow   = (g_ctrlBtns & CTRL_BTN_DOWN) != 0;
         bool dnPrev  = (g_prevBtns & CTRL_BTN_DOWN) != 0;
-        if (upNow && !upPrev && g_bmm150Ok) {
+        if (upNow && !upPrev && compassHeadingValid()) {
             engageHeadingHold();
         }
         if (dnNow && !dnPrev && g_headingHoldActive) {
@@ -995,7 +1203,13 @@ void loop() {
 
                 if (now - lastAutopilot >= AUTOPILOT_MS) {
                     lastAutopilot = now;
-                    autopilotUpdate();
+                    if (compassHeadingValid()) {
+                        autopilotUpdate();
+                    } else {
+                        // No heading: stop moving the rudder until the
+                        // compass recovers.
+                        g_apOutput = 0.0f;
+                    }
                 }
                 if (now - lastApSend >= AP_SEND_MS) {
                     lastApSend = now;
@@ -1062,7 +1276,8 @@ void loop() {
     if (!g_calActive && (now - lastLog >= DIAG_LOG_MS)) {
         lastLog = now;
 
-        const char* calTag = g_calibrated ? "CAL" : "UNCAL";
+        const char* calTag = !compassHeadingValid() ? "NO COMPASS"
+                           : g_calibrated           ? "CAL" : "UNCAL";
 
         if (g_headingHoldActive) {
             float err = headingError(g_heading, g_targetHeading);
