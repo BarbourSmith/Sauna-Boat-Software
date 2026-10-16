@@ -21,6 +21,7 @@
 #include <TinyGPSPlus.h>
 #include <DFRobot_BMM150.h>
 #include "mesh_protocol.h"
+#include "route_track.h"
 
 // ---------------------------------------------------------------------------
 // Pin definitions
@@ -68,6 +69,11 @@ static float g_apKd         = 0.12f;   // derivative gain
 static float g_apMaxOutput  = 1.0f;    // max steering command magnitude [0, 1]
 static float g_apDeadband   = 3.0f;    // ignore errors smaller than this (degrees)
 static float g_apRateLimit  = 0.05f;   // max change in output per autopilot tick
+
+// ---------------------------------------------------------------------------
+// Route following (see route_track.h)
+// ---------------------------------------------------------------------------
+static constexpr float ROUTE_LOOKAHEAD_M = 10.0f; // steer for the point this far along the track beyond the boat
 
 // ---------------------------------------------------------------------------
 // Peripherals
@@ -189,6 +195,10 @@ static uint8_t g_routeExpectedChunks = 0;
 static uint8_t g_routeReceivedWaypoints = 0;
 static uint8_t g_routeNextChunk = 0;
 static uint16_t g_routeDistanceM = 0;
+static volatile bool g_routeStartRequested = false; // set by ESP-NOW; started from loop() so the track is only touched there
+static RouteTrack    g_routeTrack = {};             // the running route; a new upload doesn't disturb it
+static RouteGuidance g_routeGuide = {};             // latest guidance while a route runs
+static float         g_routeFinishRadiusM = ROUTE_DEFAULT_RADIUS_M;
 
 // ESP-NOW diagnostics
 static uint32_t g_sendCount     = 0;
@@ -653,6 +663,7 @@ static void abortRoute(uint8_t reason) {
     g_routeRunning = false;
     g_routeCurrentIndex = 0;
     g_routeDistanceM = 0;
+    g_routeGuide = {};
     disengageHeadingHold();
     sendSteeringSpeed(0.0f);
     broadcastRouteAbort(reason);
@@ -673,14 +684,25 @@ static bool startRouteExecution() {
         return false;
     }
 
+    // Join the track wherever the boat is closest to it; waypoints before
+    // that point are skipped.
+    routeTrackBuild(g_routeTrack, g_routePoints, g_routeCount);
+    routeTrackJoin(g_routeTrack, gps.location.lat(), gps.location.lng());
+    uint16_t finishRadius = g_routePoints[g_routeCount - 1].radiusM;
+    g_routeFinishRadiusM = finishRadius == 0 ? ROUTE_DEFAULT_RADIUS_M : finishRadius;
+    g_routeGuide = routeTrackUpdate(g_routeTrack, gps.location.lat(), gps.location.lng(),
+                                    ROUTE_LOOKAHEAD_M, g_routeFinishRadiusM);
+
     g_routeRunning = true;
-    g_routeCurrentIndex = 0;
+    g_routeCurrentIndex = g_routeGuide.nextIndex;
     g_routeDistanceM = 0;
     if (!g_headingHoldActive) {
         engageHeadingHold();
     }
     broadcastRouteStatus(ROUTE_STATE_RUNNING);
-    Serial.printf("[Route] START route=%u waypoints=%u\n", g_routeId, g_routeCount);
+    Serial.printf("[Route] START route=%u waypoints=%u, joining %.0f m along the %.0f m track (next wp %u)\n",
+                  g_routeId, g_routeCount, g_routeGuide.progressM, g_routeGuide.lengthM,
+                  g_routeCurrentIndex + 1);
     return true;
 }
 
@@ -696,48 +718,33 @@ static void updateRouteGuidance() {
     // if it stays down for COMPASS_LOST_HOLD_MS.
     if (!compassHeadingValid()) return;
 
-    if (g_routeCurrentIndex >= g_routeCount) {
+    g_routeGuide = routeTrackUpdate(g_routeTrack, gps.location.lat(), gps.location.lng(),
+                                    ROUTE_LOOKAHEAD_M, g_routeFinishRadiusM);
+    g_routeDistanceM = (uint16_t)constrain(g_routeGuide.nextDistanceM, 0.0f, 65535.0f);
+
+    // A waypoint counts as reached once the boat is past it along the track,
+    // however close it came.
+    while (g_routeCurrentIndex < g_routeGuide.nextIndex) {
+        broadcastWaypointReached(g_routeCurrentIndex++);
+    }
+
+    if (g_routeGuide.finished) {
+        while (g_routeCurrentIndex < g_routeCount) {
+            broadcastWaypointReached(g_routeCurrentIndex++);
+        }
         g_routeRunning = false;
         broadcastRouteComplete();
         broadcastRouteStatus(ROUTE_STATE_COMPLETE);
         disengageHeadingHold();
         sendSteeringSpeed(0.0f);
+        Serial.println("[Route] COMPLETE");
         return;
     }
 
-    WaypointData wp = g_routePoints[g_routeCurrentIndex];
-    double tgtLat = (double)wp.latE7 / 10000000.0;
-    double tgtLon = (double)wp.lonE7 / 10000000.0;
-    double curLat = gps.location.lat();
-    double curLon = gps.location.lng();
-
-    double distance = TinyGPSPlus::distanceBetween(curLat, curLon, tgtLat, tgtLon);
-    if (distance < 0.0) distance = 0.0;
-    if (distance > 65535.0) distance = 65535.0;
-    g_routeDistanceM = (uint16_t)distance;
-
-    uint16_t radiusM = wp.radiusM == 0 ? ROUTE_DEFAULT_RADIUS_M : wp.radiusM;
-    if (distance <= radiusM) {
-        broadcastWaypointReached(g_routeCurrentIndex);
-        ++g_routeCurrentIndex;
-        if (g_routeCurrentIndex >= g_routeCount) {
-            g_routeRunning = false;
-            broadcastRouteComplete();
-            broadcastRouteStatus(ROUTE_STATE_COMPLETE);
-            disengageHeadingHold();
-            sendSteeringSpeed(0.0f);
-            Serial.println("[Route] COMPLETE");
-            return;
-        }
-    }
-
-    WaypointData nextWp = g_routePoints[g_routeCurrentIndex];
-    double nextLat = (double)nextWp.latE7 / 10000000.0;
-    double nextLon = (double)nextWp.lonE7 / 10000000.0;
-    g_targetHeading = (float)TinyGPSPlus::courseTo(curLat, curLon, nextLat, nextLon);
     if (!g_headingHoldActive) {
         engageHeadingHold();
     }
+    g_targetHeading = g_routeGuide.targetHeading;
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +806,7 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         g_routeNextChunk = 0;
         g_routeUploadActive = true;
         g_routeRunning = false;
+        g_routeStartRequested = false;
         memset(g_routePoints, 0, sizeof(g_routePoints));
         broadcastRouteStatus(ROUTE_STATE_UPLOADING);
         Serial.printf("[Route] START upload route=%u wps=%u chunks=%u\n",
@@ -873,8 +881,9 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         if (m.routeId != g_routeId) return;
 
         if (m.action == ROUTE_ACTION_START) {
-            startRouteExecution();
+            g_routeStartRequested = true;
         } else if (m.action == ROUTE_ACTION_STOP) {
+            g_routeStartRequested = false;
             abortRoute(ROUTE_ABORT_STOP_REQUESTED);
         }
         return;
@@ -909,6 +918,9 @@ static void buildStatusJson(String& out) {
     out += ",\"routeRun\":"; out += g_routeRunning ? "true" : "false";
     out += ",\"routeUp\":"; out += g_routeUploadActive ? "true" : "false";
     out += ",\"routeDist\":"; out += (unsigned long)g_routeDistanceM;
+    out += ",\"routeAlong\":"; out += String(g_routeGuide.progressM, 0);
+    out += ",\"routeLen\":"; out += String(g_routeGuide.lengthM, 0);
+    out += ",\"routeXte\":"; out += String(g_routeGuide.crossTrackM, 1);
     out += ",\"gpsFix\":";   out += gps.location.isValid() ? "true" : "false";
     out += ",\"gpsSats\":";  out += (unsigned long)gps.satellites.value();
     if (gps.location.isValid()) {
@@ -1168,6 +1180,10 @@ void loop() {
         g_prevBtns = g_ctrlBtns;
     }
 
+    if (g_routeStartRequested) {
+        g_routeStartRequested = false;
+        startRouteExecution();
+    }
     updateRouteGuidance();
 
     if (g_headingHoldActive) {
@@ -1289,6 +1305,12 @@ void loop() {
         } else {
             Serial.printf("[AP] MANUAL  hdg=%.1f° [%s]  stick=%.2f\n",
                           g_heading, calTag, g_stickLX);
+        }
+
+        if (g_routeRunning) {
+            Serial.printf("[Route] next wp %u/%u %um  along %.0f/%.0fm  off-track %+.1fm\n",
+                          g_routeCurrentIndex + 1, g_routeCount, g_routeDistanceM,
+                          g_routeGuide.progressM, g_routeGuide.lengthM, g_routeGuide.crossTrackM);
         }
 
         if (gps.location.isValid()) {

@@ -97,16 +97,21 @@
 
 // MSG_ROUTE_CONTROL – sent by handheld to start/stop execution.
 //   action uses ROUTE_ACTION_* constants below.
+//   Navigation follows the line through the waypoints rather than steering
+//   for each one, joining it wherever the boat is closest; waypoints before
+//   that point are skipped.
 #define MSG_ROUTE_CONTROL 0x0D
 
 // MSG_ROUTE_STATUS – broadcast by navigation for route upload/run state.
 //   state uses ROUTE_STATE_* constants below.
 #define MSG_ROUTE_STATUS 0x0E
 
-// MSG_WAYPOINT_REACHED – broadcast by navigation when advancing to next waypoint.
+// MSG_WAYPOINT_REACHED – broadcast by navigation once the boat is past a
+//   waypoint along the route, however close it came to it.
 #define MSG_WAYPOINT_REACHED 0x0F
 
-// MSG_ROUTE_COMPLETE – broadcast by navigation when final waypoint is reached.
+// MSG_ROUTE_COMPLETE – broadcast by navigation when the boat is inside the
+//   final waypoint's radius, or past the end of the route.
 #define MSG_ROUTE_COMPLETE 0x10
 
 // MSG_ROUTE_ABORT – broadcast by navigation when route execution aborts.
@@ -206,7 +211,8 @@ struct NavigationMessage {
 };  // 24 bytes
 
 // Fixed-point waypoint for deterministic transfer and storage.
-// latE7/lonE7 are degrees scaled by 1e7 (WGS84), radius in meters.
+// latE7/lonE7 are degrees scaled by 1e7 (WGS84), radius in meters. Only the
+// final waypoint's radius is used: the route finishes inside it.
 struct WaypointData {
     int32_t  latE7;
     int32_t  lonE7;
@@ -252,9 +258,9 @@ struct RouteStatusMessage {
     uint8_t  src;           // MODULE_NAVIGATION
     uint8_t  routeId;
     uint8_t  state;         // ROUTE_STATE_*
-    uint8_t  currentIndex;  // [0, totalWaypoints)
+    uint8_t  currentIndex;  // [0, totalWaypoints): next waypoint ahead along the route
     uint8_t  totalWaypoints;
-    uint16_t distanceM;     // distance to current waypoint when running
+    uint16_t distanceM;     // straight-line distance to that waypoint when running
 };  // 8 bytes
 
 struct WaypointReachedMessage {
