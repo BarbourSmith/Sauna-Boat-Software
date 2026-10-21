@@ -2,8 +2,6 @@
 // Plain ESP32 — reads a BMM150 3-axis magnetometer (I2C) and NEO-6M GPS
 // (UART2) and broadcasts position + heading to other modules via ESP-NOW.
 //
-// Web UI at http://192.168.4.1 — connect to WiFi AP "SaunaBoatNav".
-//
 // Wiring:
 //   BMM150  SDA  → GPIO 21      NEO-6M  TX → GPIO 16  (UART2 RX)
 //   BMM150  SCL  → GPIO 22      NEO-6M  RX → GPIO 17  (UART2 TX)
@@ -15,9 +13,6 @@
 #include <esp_now.h>
 #include <esp_system.h>
 #include <Preferences.h>
-#include <LittleFS.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
 #include <TinyGPSPlus.h>
 #include <DFRobot_BMM150.h>
 #include "mesh_protocol.h"
@@ -35,12 +30,6 @@
 #define BMM150_I2C_ADDR  0x13  // BMM150 default I2C address
 
 // ---------------------------------------------------------------------------
-// WiFi Access Point credentials
-// ---------------------------------------------------------------------------
-static const char* AP_SSID = "SaunaBoatNav";
-static const char* AP_PASS = "12345678";
-
-// ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
 static constexpr unsigned long NAV_BROADCAST_MS  = 500;   // 2 Hz mesh broadcast
@@ -49,7 +38,6 @@ static constexpr unsigned long CAL_DURATION_MS   = 45000; // calibration collect
 static constexpr unsigned long CAL_PROGRESS_MS   = 1000;  // calibration progress prints
 static constexpr unsigned long AUTOPILOT_MS      = 200;   // 5 Hz autopilot compute rate
 static constexpr unsigned long AP_SEND_MS        = 50;    // 20 Hz send rate — must be well under the steering watchdog (200 ms)
-static constexpr unsigned long WS_BROADCAST_MS   = 200;   // 5 Hz WebSocket status broadcast
 static constexpr float         STICK_OVERRIDE_ENTER = 0.20f; // enter manual-yield above this magnitude
 static constexpr float         STICK_OVERRIDE_EXIT  = 0.10f; // remain in manual-yield until below this magnitude
 static constexpr unsigned long CTRL_INPUT_TIMEOUT_MS = 1000; // controller input considered stale after this
@@ -120,8 +108,6 @@ public:
 static TinyGPSPlus        gps;
 static CheckedBMM150      bmm150(&Wire, BMM150_I2C_ADDR);
 static Preferences        prefs;
-static AsyncWebServer     server(80);
-static AsyncWebSocket     ws("/ws");
 
 // ---------------------------------------------------------------------------
 // State
@@ -159,7 +145,6 @@ static float g_calOffsetZ = 0.0f;
 static bool  g_calibrated = false;
 
 // Calibration collection state
-static volatile bool g_calRequested = false; // set by the web UI; started from loop() so I2C stays on one task
 static bool          g_calActive    = false;
 static unsigned long g_calStartTime = 0;
 static float g_calMinX, g_calMaxX;
@@ -890,58 +875,6 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket helpers
-// ---------------------------------------------------------------------------
-static void buildStatusJson(String& out) {
-    float err = headingError(g_heading, g_targetHeading);
-    out = "{\"hdg\":";       out += String(g_heading, 1);
-    out += ",\"magOk\":";    out += compassHeadingValid() ? "true" : "false";
-    out += ",\"magLost\":";  out += (unsigned long)g_compassLostCount;
-    out += ",\"reset\":\"";  out += g_resetReason; out += "\"";
-    out += ",\"cal\":";      out += g_calibrated ? "true" : "false";
-    out += ",\"calActive\":"; out += g_calActive ? "true" : "false";
-    if (g_calActive) {
-        unsigned long elapsed = millis() - g_calStartTime;
-        unsigned long remaining = (elapsed < CAL_DURATION_MS) ? (CAL_DURATION_MS - elapsed) / 1000 : 0;
-        out += ",\"calRemain\":"; out += remaining;
-    }
-    out += ",\"hold\":";     out += g_headingHoldActive ? "true" : "false";
-    out += ",\"target\":";   out += String(g_targetHeading, 1);
-    out += ",\"err\":";      out += String(err, 1);
-    out += ",\"steer\":";    out += String(g_apOutput, 3);
-    out += ",\"ctrl\":";     out += g_ctrlOnline ? "true" : "false";
-    out += ",\"stick\":";    out += String(g_stickLX, 2);
-    out += ",\"routeId\":"; out += (unsigned long)g_routeId;
-    out += ",\"routeCount\":"; out += (unsigned long)g_routeCount;
-    out += ",\"routeIdx\":"; out += (unsigned long)g_routeCurrentIndex;
-    out += ",\"routeRun\":"; out += g_routeRunning ? "true" : "false";
-    out += ",\"routeUp\":"; out += g_routeUploadActive ? "true" : "false";
-    out += ",\"routeDist\":"; out += (unsigned long)g_routeDistanceM;
-    out += ",\"routeAlong\":"; out += String(g_routeGuide.progressM, 0);
-    out += ",\"routeLen\":"; out += String(g_routeGuide.lengthM, 0);
-    out += ",\"routeXte\":"; out += String(g_routeGuide.crossTrackM, 1);
-    out += ",\"gpsFix\":";   out += gps.location.isValid() ? "true" : "false";
-    out += ",\"gpsSats\":";  out += (unsigned long)gps.satellites.value();
-    if (gps.location.isValid()) {
-        out += ",\"lat\":";  out += String(gps.location.lat(), 6);
-        out += ",\"lon\":";  out += String(gps.location.lng(), 6);
-        out += ",\"spd\":";  out += String(gps.speed.knots(), 1);
-        out += ",\"crs\":";  out += String(gps.course.deg(), 1);
-    }
-    out += ",\"gpsChars\":"; out += (unsigned long)gps.charsProcessed();
-    out += "}";
-}
-
-static void onWsEvent(AsyncWebSocket* /*srv*/, AsyncWebSocketClient* client,
-                      AwsEventType type, void* /*arg*/, uint8_t* /*data*/, size_t /*len*/) {
-    if (type == WS_EVT_CONNECT) {
-        Serial.printf("[WS] Client #%u connected\n", client->id());
-    } else if (type == WS_EVT_DISCONNECT) {
-        Serial.printf("[WS] Client #%u disconnected\n", client->id());
-    }
-}
-
 static const char* resetReasonName(esp_reset_reason_t reason) {
     switch (reason) {
         case ESP_RST_POWERON:   return "power-on";
@@ -986,23 +919,12 @@ void setup() {
     calLoadFromNVS();
     loadTuningFromNVS();
 
-    // --- LittleFS ---
-    if (!LittleFS.begin(true)) {
-        Serial.println("[Setup] ERROR: LittleFS mount failed!");
-    } else {
-        Serial.println("[Setup] LittleFS mounted.");
-    }
-
-    // --- WiFi AP+STA + ESP-NOW ---
-    // AP_STA mode is required so the STA interface is available for ESP-NOW
-    // reception while the AP interface serves the web UI.
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS, MESH_WIFI_CHANNEL);
-    WiFi.disconnect();  // STA not joining any network, just kept active for ESP-NOW
+    // --- WiFi + ESP-NOW ---
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();  // not joining any network, just kept active for ESP-NOW
     esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[Setup] WiFi AP \"%s\" on channel %d started.\n", AP_SSID, MESH_WIFI_CHANNEL);
-    Serial.printf("[Setup] Open http://%s in your browser.\n", ip.toString().c_str());
+    Serial.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
+                  WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[Setup] ERROR: ESP-NOW init failed!");
@@ -1012,8 +934,7 @@ void setup() {
     esp_now_register_send_cb(onDataSent);
     esp_now_register_recv_cb(onMeshReceive);
 
-    // Register broadcast peer on BOTH interfaces so ESP-NOW works regardless
-    // of which interface the sender used.
+    // Register the broadcast peer so this module can send to the mesh.
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
     peer.channel = MESH_WIFI_CHANNEL;
@@ -1024,83 +945,6 @@ void setup() {
     } else {
         Serial.println("[Setup] WARNING: Failed to register broadcast peer.");
     }
-
-    // --- WebSocket ---
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws);
-
-    // --- HTTP routes ---
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send(LittleFS, "/index.html", "text/html");
-    });
-
-    // GET /settings — returns autopilot tuning as JSON
-    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"kp\":";    json += String(g_apKp, 4);
-        json += ",\"ki\":";          json += String(g_apKi, 4);
-        json += ",\"kd\":";          json += String(g_apKd, 4);
-        json += ",\"maxOutput\":";   json += String(g_apMaxOutput, 3);
-        json += ",\"deadband\":";    json += String(g_apDeadband, 1);
-        json += ",\"rateLimit\":";   json += String(g_apRateLimit, 4);
-        json += "}";
-        request->send(200, "application/json", json);
-    });
-
-    // POST /settings — save autopilot tuning
-    static String settingsBody;
-    server.on("/settings", HTTP_POST,
-        [](AsyncWebServerRequest* request) {
-            auto parseField = [](const String& json, const char* key, float fallback) -> float {
-                String search = "\""; search += key; search += "\":";
-                int idx = json.indexOf(search);
-                if (idx < 0) return fallback;
-                return json.substring(idx + search.length()).toFloat();
-            };
-
-            g_apKp        = parseField(settingsBody, "kp",        g_apKp);
-            g_apKi        = parseField(settingsBody, "ki",        g_apKi);
-            g_apKd        = parseField(settingsBody, "kd",        g_apKd);
-            g_apMaxOutput = parseField(settingsBody, "maxOutput",  g_apMaxOutput);
-            g_apDeadband  = parseField(settingsBody, "deadband",   g_apDeadband);
-            g_apRateLimit = parseField(settingsBody, "rateLimit",  g_apRateLimit);
-
-            // Clamp to sane ranges
-            g_apKp        = constrain(g_apKp,        0.0f, 1.0f);
-            g_apKi        = constrain(g_apKi,        0.0f, 1.0f);
-            g_apKd        = constrain(g_apKd,        0.0f, 5.0f);
-            g_apMaxOutput = constrain(g_apMaxOutput,  0.05f, 1.0f);
-            g_apDeadband  = constrain(g_apDeadband,   0.0f, 30.0f);
-            g_apRateLimit = constrain(g_apRateLimit,  0.001f, 1.0f);
-
-            saveTuningToNVS();
-
-            // Reset integral when tuning changes to prevent stale buildup
-            g_integral = 0.0f;
-
-            Serial.printf("[Settings] Saved — Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f\n",
-                          g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
-            request->send(200, "application/json", "{\"ok\":true}");
-        },
-        nullptr,
-        [](AsyncWebServerRequest*, uint8_t* data, size_t len,
-           size_t index, size_t) {
-            if (index == 0) settingsBody = "";
-            settingsBody += String(reinterpret_cast<const char*>(data), len);
-        }
-    );
-
-    // POST /calibrate — trigger compass calibration from the web UI
-    server.on("/calibrate", HTTP_POST, [](AsyncWebServerRequest* request) {
-        if (g_calActive) {
-            request->send(200, "application/json", "{\"ok\":false,\"msg\":\"already running\"}");
-        } else {
-            g_calRequested = true;
-            request->send(200, "application/json", "{\"ok\":true}");
-        }
-    });
-
-    server.begin();
-    Serial.println("[Setup] HTTP server started.");
 
     // If loop() ever hangs, reboot (after 5 s) rather than sit dead until
     // someone power-cycles the module.
@@ -1120,7 +964,6 @@ void loop() {
     static unsigned long lastCalProg    = 0;
     static unsigned long lastAutopilot  = 0;
     static unsigned long lastApSend     = 0;
-    static unsigned long lastWsBcast    = 0;
     unsigned long now = millis();
 
     // --- Serial command handling ---
@@ -1143,11 +986,6 @@ void loop() {
     // Update compass heading (also feeds calibration when active, and
     // re-initialises the sensor if it has stopped responding).
     updateCompass(now);
-
-    if (g_calRequested) {
-        g_calRequested = false;
-        if (!g_calActive) calStart();
-    }
 
     // While the compass is down the autopilot is paused (see below). If it
     // doesn't come back, hand control back to the operator.
@@ -1271,23 +1109,6 @@ void loop() {
         } else {
             broadcastRouteStatus(ROUTE_STATE_IDLE);
         }
-    }
-
-    // Broadcast status to WebSocket clients.
-    if (now - lastWsBcast >= WS_BROADCAST_MS) {
-        lastWsBcast = now;
-        if (ws.count() > 0) {
-            String json;
-            buildStatusJson(json);
-            ws.textAll(json);
-        }
-    }
-
-    // Periodically clean up disconnected WebSocket clients.
-    static unsigned long lastCleanup = 0;
-    if (now - lastCleanup >= 1000) {
-        lastCleanup = now;
-        ws.cleanupClients();
     }
 
     // Periodic serial diagnostics.

@@ -18,8 +18,7 @@ message, and any other module can listen and act on it.
 └── modules/
     ├── steering/            ← ESP32-S3 on Maslow 4 board; drives the rudder motor
     │   ├── platformio.ini
-    │   ├── src/             ← C++ firmware
-    │   └── data/            ← LittleFS web UI (index.html)
+    │   └── src/             ← C++ firmware
     └── handheld_controller/ ← ESP32-S3 (Pavloff board); custom handheld with
         ├── platformio.ini     analog joystick, SSD1306 OLED, MPU-6050 wake-on-
         └── src/               motion, and on-board LiPo
@@ -41,15 +40,15 @@ position feedback. Runs a PID loop to hold a target heading.
 **Interfaces:**
 | Interface | Details |
 |-----------|---------|
-| WiFi AP | SSID `SaunaBoatSteering`, password `12345678`, IP `192.168.4.1` |
-| Web UI | Open `http://192.168.4.1` — compass display, heading slider, PID settings |
 | ESP-NOW | Receives `MSG_SET_ANGLE` from any module on WiFi channel 1 |
+
+None of the modules host a web page or create a WiFi network; the radio is
+used only for ESP-NOW.
 
 **Build & flash:**
 ```bash
 cd modules/steering
 pio run -t upload       # flash firmware
-pio run -t uploadfs     # flash web UI (index.html → LittleFS)
 ```
 
 ---
