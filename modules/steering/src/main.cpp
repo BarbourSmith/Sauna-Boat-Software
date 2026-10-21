@@ -5,6 +5,9 @@
 //   Servo signal pin : GPIO 48
 //   LEDC channel     : 6
 //
+// Logs, serial commands and firmware updates also go over the mesh, through
+// the handheld's USB port (see mesh_remote.h).
+//
 // Mesh: accepts MSG_CONTROLLER_INPUT from input modules over ESP-NOW.
 // Raw stick and button state is received here; this module applies dead-zone
 // and interprets D-pad left/right as trim jog commands.
@@ -17,6 +20,7 @@
 #include <Preferences.h>
 #include "MotorUnit.h"
 #include "mesh_protocol.h"
+#include "mesh_remote.h"
 
 // ---------------------------------------------------------------------------
 // Steering servo pin definitions
@@ -70,6 +74,7 @@ static bool           g_handheldOverrideActive = false;
 // All 32-bit-aligned globals written here are updated atomically on ESP32.
 // ---------------------------------------------------------------------------
 static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) {
+    if (meshRemoteReceive(data, len)) return;
     if (len < 1) return;
     uint8_t type = data[0];
 
@@ -125,8 +130,8 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
         if (g_trimDirty && (btns & (CTRL_BTN_LEFT | CTRL_BTN_RIGHT)) == 0
                         && (g_prevButtons & (CTRL_BTN_LEFT | CTRL_BTN_RIGHT)) != 0) {
             // Both buttons just released — log the settled trim value.
-            Serial.printf("[Trim] Adjusted to %.4f (will save to NVS shortly)\n",
-                          steeringMotor.getTrim());
+            Log.printf("[Trim] Adjusted to %.4f (will save to NVS shortly)\n",
+                       steeringMotor.getTrim());
         }
         g_prevButtons = btns;
 
@@ -183,7 +188,7 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== Sauna Boat Steering System ===");
+    Log.println("\n=== Sauna Boat Steering System ===");
 
     // --- Steering servo ---
     steeringMotor.begin(SERVO_PIN);
@@ -199,20 +204,21 @@ void setup() {
     steeringMotor.setRampRate(rampMs > 0 ? 1000.0f / rampMs : 0.0f);
     // trim: persistent servo centre offset set via D-pad buttons on the controller.
     steeringMotor.setTrim(prefs.getFloat("trim", 0.0f));
-    Serial.printf("[Setup] Settings loaded – maxTravel=%d rampMs=%d trim=%.4f\n",
-                  steeringMotor.getMaxSpeed(), rampMs, steeringMotor.getTrim());
+    Log.printf("[Setup] Settings loaded – maxTravel=%d rampMs=%d trim=%.4f\n",
+               steeringMotor.getMaxSpeed(), rampMs, steeringMotor.getTrim());
 
     // --- WiFi + ESP-NOW (mesh receive) ---
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
-                  WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
+    Log.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
+               WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
 
     if (esp_now_init() != ESP_OK) {
-        Serial.println("[Setup] ERROR: ESP-NOW init failed!");
+        Log.println("[Setup] ERROR: ESP-NOW init failed!");
     } else {
-        Serial.println("[Setup] ESP-NOW initialised.");
+        Log.println("[Setup] ESP-NOW initialised.");
+        meshRemoteBegin(MODULE_STEERING);
         esp_now_register_recv_cb(onMeshReceive);
     }
 }
@@ -221,6 +227,8 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    if (meshRemoteLoop()) return;  // receiving new firmware: hold the rudder where it is
+
     static bool lastHoldState = false;
 
     if (g_headingHoldActive &&
@@ -229,7 +237,7 @@ void loop() {
     }
 
     if (g_headingHoldActive != lastHoldState) {
-        Serial.printf("[Hold] %s\n", g_headingHoldActive ? "ACTIVE" : "INACTIVE");
+        Log.printf("[Hold] %s\n", g_headingHoldActive ? "ACTIVE" : "INACTIVE");
         lastHoldState = g_headingHoldActive;
     }
 
@@ -238,14 +246,14 @@ void loop() {
     if (g_trimDirty && (millis() - g_trimLastChange) >= TRIM_SAVE_DEBOUNCE_MS) {
         prefs.putFloat("trim", steeringMotor.getTrim());
         g_trimDirty = false;
-        Serial.printf("[Trim] Saved to NVS: %.4f\n", steeringMotor.getTrim());
+        Log.printf("[Trim] Saved to NVS: %.4f\n", steeringMotor.getTrim());
     }
 
     // Periodically log diagnostics to serial for debugging
     static unsigned long lastDiag = 0;
     if (millis() - lastDiag >= 500) {
         lastDiag = millis();
-        Serial.printf("[Loop] speed=%.2f\n", g_currentSpeed);
+        Log.printf("[Loop] speed=%.2f\n", g_currentSpeed);
     }
 
     // Step the servo position toward the commanded speed at the configured ramp rate

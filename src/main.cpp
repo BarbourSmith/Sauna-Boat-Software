@@ -5,6 +5,9 @@
 //   Servo signal pin : GPIO 48
 //   LEDC channel     : 6
 //
+// Logs, serial commands and firmware updates also go over the mesh, through
+// the handheld's USB port (see mesh_remote.h).
+//
 // Mesh: accepts MSG_SET_STEERING commands from any module over ESP-NOW.
 // The radio is fixed on MESH_WIFI_CHANNEL and joins no WiFi network.
 
@@ -15,6 +18,7 @@
 #include <Preferences.h>
 #include "MotorUnit.h"
 #include "mesh_protocol.h"
+#include "mesh_remote.h"
 
 // ---------------------------------------------------------------------------
 // Steering servo pin definitions
@@ -54,6 +58,7 @@ static bool g_handheldOverrideActive = false;
 // aligned values and the ESP32 performs 32-bit loads/stores atomically.
 // ---------------------------------------------------------------------------
 static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) {
+    if (meshRemoteReceive(data, len)) return;
     if (len < 1) return;
     uint8_t type = data[0];
 
@@ -110,7 +115,7 @@ static void onMeshReceive(const uint8_t* /*mac*/, const uint8_t* data, int len) 
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== Sauna Boat Steering System ===");
+    Log.println("\n=== Sauna Boat Steering System ===");
 
     // --- Steering servo ---
     steeringMotor.begin(SERVO_PIN);
@@ -128,21 +133,22 @@ void setup() {
     steeringMotor.setReversed(prefs.getBool("dirReverse", false));
     // trimUs: servo center trim offset in µs (-500 to +500).
     steeringMotor.setTrimUs(prefs.getInt("trimUs", 0));
-    Serial.printf("[Setup] Settings loaded – maxTravel=%d rampMs=%d dirReverse=%d trimUs=%d\n",
-                  steeringMotor.getMaxSpeed(), rampMs,
-                  steeringMotor.getReversed(), steeringMotor.getTrimUs());
+    Log.printf("[Setup] Settings loaded – maxTravel=%d rampMs=%d dirReverse=%d trimUs=%d\n",
+               steeringMotor.getMaxSpeed(), rampMs,
+               steeringMotor.getReversed(), steeringMotor.getTrimUs());
 
     // --- WiFi + ESP-NOW (mesh receive) ---
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
-                  WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
+    Log.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
+               WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
 
     if (esp_now_init() != ESP_OK) {
-        Serial.println("[Setup] ERROR: ESP-NOW init failed!");
+        Log.println("[Setup] ERROR: ESP-NOW init failed!");
     } else {
-        Serial.println("[Setup] ESP-NOW initialised.");
+        Log.println("[Setup] ESP-NOW initialised.");
+        meshRemoteBegin(MODULE_STEERING);
         esp_now_register_recv_cb(onMeshReceive);
     }
 }
@@ -151,11 +157,13 @@ void setup() {
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    if (meshRemoteLoop()) return;  // receiving new firmware: hold the rudder where it is
+
     // Periodically log diagnostics to serial for debugging
     static unsigned long lastDiag = 0;
     if (millis() - lastDiag >= 500) {
         lastDiag = millis();
-        Serial.printf("[Loop] speed=%.2f\n", g_currentSpeed);
+        Log.printf("[Loop] speed=%.2f\n", g_currentSpeed);
     }
 
     // Step the servo position toward the commanded speed at the configured ramp rate

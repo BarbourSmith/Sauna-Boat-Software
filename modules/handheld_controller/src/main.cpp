@@ -11,6 +11,10 @@
 // Display shows controller diagnostics (battery, Wi-Fi/ESP-NOW link status,
 // steering status, joystick values) for field debugging.
 //
+// USB gateway: a computer on the USB port can read the other modules' logs,
+// send them serial commands and update their firmware over the mesh
+// (tools/mesh_gateway).
+//
 // Power management: after IDLE_SLEEP_MS of no joystick deflection or button
 // press the board enters deep sleep. It wakes on either MPU-6050 motion
 // (EXT1 / GPIO 18) or joystick button click (EXT0 / GPIO 6 pulled LOW),
@@ -23,6 +27,7 @@
 #include <esp_now.h>
 #include <esp_sleep.h>
 #include <Preferences.h>
+#include <mbedtls/base64.h>
 
 #include <MPU6050.h>
 #include <Adafruit_GFX.h>
@@ -566,11 +571,13 @@ static void processRouteTransfer(unsigned long now) {
 //   $POS                      -> $POS,<fixType>,<latE7>,<lonE7>,<heading|-1>
 //   $PING                     -> $OK,PING
 //
+// The USB gateway to the mesh adds $MON, $CMD and $OTA (see below).
+//
 // Failures reply $ERR,<CMD>,<reason>. Any command counts as user activity so
 // the controller stays awake while the planner is connected.
 static constexpr uint8_t SERIAL_PROTOCOL_VERSION = 1;
 
-static char   g_serialLine[128];
+static char   g_serialLine[400];  // long enough for an $OTA,DATA line
 static size_t g_serialLineLen      = 0;
 static bool   g_serialLineOverflow = false;
 
@@ -618,12 +625,284 @@ static void sanitizeRouteName(const char* in, char* out, size_t outSize) {
     out[n] = '\0';
 }
 
+// ---------------------------------------------------------------------------
+// USB gateway to the mesh
+// ---------------------------------------------------------------------------
+// Lets a computer reach the steering and navigation modules, whose USB ports
+// are hard to get at on the boat (tools/mesh_gateway; the modules' side is
+// shared/mesh_remote.h). <module> is a MODULE_* number.
+//
+//   $MON,<flags>              -> $OK,MON   relay the mesh to USB for the next
+//                                          GATEWAY_MON_MS; the host repeats it.
+//                                          flags: 1 = module logs, 2 = all other traffic
+//   $CMD,<module>,<text>      -> $OK,CMD   run text as a serial command on a module
+//   $OTA,BEGIN,<module>,<size>,<md5 hex>
+//                             -> $OK,OTA,BEGIN
+//   $OTA,DATA,<offset>,<base64 chunk>
+//                             -> $OK,OTA,<offset the module wants next>
+//   $OTA,END                  -> $OK,OTA,END    module checked the image and restarts
+//   $OTA,ABORT                -> $OK,OTA,ABORT
+//
+// Relayed while monitoring:
+//   $LOG,<module>,<seq>,<text>
+//   $INFO,<module>,<resetReason>,<fwState>,<uptimeS>,<build>
+//   $RX,<packet as hex>
+static constexpr unsigned long GATEWAY_MON_MS     = 5000;
+static constexpr unsigned long GATEWAY_PING_MS    = 1000;
+static constexpr unsigned long OTA_ACK_TIMEOUT_MS = 250;   // per try, for a chunk
+static constexpr unsigned long OTA_END_TIMEOUT_MS = 3000;  // per try; BEGIN and END take the module longer
+static constexpr int           OTA_TRIES          = 5;
+static constexpr uint8_t       MON_LOGS           = 1;
+static constexpr uint8_t       MON_TRAFFIC        = 2;
+
+struct GatewayPacket {
+    uint8_t len;
+    uint8_t data[ESP_NOW_MAX_DATA_LEN];
+};
+
+static QueueHandle_t    g_gatewayQueue = nullptr;  // packets for USB, filled by onDataRecv
+static volatile uint8_t g_monFlags     = 0;        // MON_* while a computer is monitoring
+static unsigned long    g_monLastMs    = 0;
+
+// Latest MSG_OTA_ACK, written by onDataRecv.
+static portMUX_TYPE  g_otaAckMux   = portMUX_INITIALIZER_UNLOCKED;
+static OtaAckMessage g_otaAck      = {};
+static bool          g_otaAckFresh = false;
+
+static bool    g_otaActive  = false;
+static uint8_t g_otaTarget  = 0;
+static uint8_t g_otaSession = 0;
+
+// Called from onDataRecv: keep a copy for USB if the computer wants it.
+static void gatewayForward(const uint8_t* data, int len) {
+    uint8_t flags = g_monFlags;
+    if (!flags || !g_gatewayQueue || len > ESP_NOW_MAX_DATA_LEN) return;
+    bool moduleLog = data[0] == MSG_REMOTE_LOG || data[0] == MSG_REMOTE_INFO;
+    if (!(flags & (moduleLog ? MON_LOGS : MON_TRAFFIC))) return;
+    GatewayPacket p;
+    p.len = (uint8_t)len;
+    memcpy(p.data, data, len);
+    xQueueSend(g_gatewayQueue, &p, 0);
+}
+
+static void gatewayRecordAck(const uint8_t* data, int len) {
+    if (len < (int)sizeof(OtaAckMessage)) return;
+    portENTER_CRITICAL(&g_otaAckMux);
+    memcpy(&g_otaAck, data, sizeof(g_otaAck));
+    g_otaAckFresh = true;
+    portEXIT_CRITICAL(&g_otaAckMux);
+}
+
+static void gatewayPrintPacket(const GatewayPacket& p) {
+    const size_t logHeader = offsetof(RemoteLogMessage, text);
+    if (p.data[0] == MSG_REMOTE_LOG && p.len > logHeader) {
+        RemoteLogMessage m;
+        size_t len = min((size_t)p.len, sizeof(m));
+        memcpy(&m, p.data, len);
+        Serial.printf("$LOG,%u,%u,%.*s\n", m.src, m.seq, (int)(len - logHeader), m.text);
+    } else if (p.data[0] == MSG_REMOTE_INFO && p.len >= sizeof(RemoteInfoMessage)) {
+        RemoteInfoMessage m;
+        memcpy(&m, p.data, sizeof(m));
+        m.build[sizeof(m.build) - 1] = '\0';
+        Serial.printf("$INFO,%u,%u,%u,%lu,%s\n", m.src, m.resetReason, m.otaState,
+                      (unsigned long)m.uptimeS, m.build);
+    } else {
+        char hex[2 * ESP_NOW_MAX_DATA_LEN + 1] = "";
+        for (int i = 0; i < p.len; ++i) snprintf(hex + 2 * i, 3, "%02x", p.data[i]);
+        Serial.printf("$RX,%s\n", hex);
+    }
+}
+
+// Pings the modules while a computer is monitoring and relays what they send.
+static void gatewayLoop(unsigned long now) {
+    static unsigned long lastPing = 0;
+    if (g_monFlags && now - g_monLastMs >= GATEWAY_MON_MS) g_monFlags = 0;
+    if (g_monFlags && now - lastPing >= GATEWAY_PING_MS) {
+        lastPing = now;
+        RemotePingMessage ping = {MSG_REMOTE_PING, MODULE_HANDHELD};
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&ping), sizeof(ping));
+    }
+    GatewayPacket p;
+    for (int i = 0; i < 16 && xQueueReceive(g_gatewayQueue, &p, 0) == pdTRUE; ++i) {
+        gatewayPrintPacket(p);
+    }
+}
+
+// Sends msg to the module being updated and waits for its MSG_OTA_ACK,
+// resending when none comes. Returns false if the module never answered.
+static bool otaExchange(const void* msg, size_t len, unsigned long timeoutMs, OtaAckMessage& ack) {
+    for (int attempt = 0; attempt < OTA_TRIES; ++attempt) {
+        portENTER_CRITICAL(&g_otaAckMux);
+        g_otaAckFresh = false;
+        portEXIT_CRITICAL(&g_otaAckMux);
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<const uint8_t*>(msg), len);
+
+        unsigned long start = millis();
+        while (millis() - start < timeoutMs) {
+            portENTER_CRITICAL(&g_otaAckMux);
+            bool fresh = g_otaAckFresh;
+            ack = g_otaAck;
+            g_otaAckFresh = false;
+            portEXIT_CRITICAL(&g_otaAckMux);
+            if (fresh && ack.src == g_otaTarget && ack.session == g_otaSession) return true;
+            delay(1);
+        }
+    }
+    return false;
+}
+
+static const char* otaStatusText(uint8_t status) {
+    switch (status) {
+        case OTA_STATUS_BUSY:       return "module is steering; stop heading hold or the route first";
+        case OTA_STATUS_TOO_BIG:    return "firmware is too big for the module";
+        case OTA_STATUS_FLASH:      return "module could not write its flash";
+        case OTA_STATUS_VERIFY:     return "module rejected the firmware (incomplete, corrupted or for another chip)";
+        case OTA_STATUS_NO_SESSION: return "module is not receiving an update";
+        default:                    return "unknown error";
+    }
+}
+
+static bool parseHexBytes(const char* s, uint8_t* out, size_t n) {
+    if (strlen(s) != 2 * n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (!isxdigit((unsigned char)s[2 * i]) || !isxdigit((unsigned char)s[2 * i + 1])) return false;
+        char byteText[3] = {s[2 * i], s[2 * i + 1], '\0'};
+        out[i] = (uint8_t)strtol(byteText, nullptr, 16);
+    }
+    return true;
+}
+
+// Replies to an $OTA exchange, given whether the module answered.
+static void otaReply(bool answered, const OtaAckMessage& ack, const char* okText) {
+    if (!answered) {
+        Serial.printf("$ERR,OTA,no answer from module %u\n", g_otaTarget);
+    } else if (ack.status != OTA_STATUS_OK) {
+        g_otaActive = false;  // the module has given up on this update
+        Serial.printf("$ERR,OTA,%s\n", otaStatusText(ack.status));
+    } else if (okText) {
+        Serial.printf("$OK,OTA,%s\n", okText);
+    } else {
+        Serial.printf("$OK,OTA,%lu\n", (unsigned long)ack.nextOffset);
+    }
+}
+
+static void handleOtaCommand(char* args) {
+    char* f[4] = {};
+    int n = splitFields(args, f, 4);
+    OtaAckMessage ack = {};
+
+    if (n >= 1 && strcmp(f[0], "BEGIN") == 0) {
+        long module, size;
+        OtaBeginMessage m = {};
+        if (n < 4 || !parseLongField(f[1], 0, 255, &module) || module == MODULE_HANDHELD ||
+            !parseLongField(f[2], 1, 16L * 1024 * 1024, &size) || !parseHexBytes(f[3], m.md5, 16)) {
+            Serial.println("$ERR,OTA,expected BEGIN,<module>,<size>,<md5>");
+            return;
+        }
+        g_otaTarget  = (uint8_t)module;
+        g_otaSession = (uint8_t)esp_random();
+        m.type    = MSG_OTA_BEGIN;
+        m.src     = MODULE_HANDHELD;
+        m.target  = g_otaTarget;
+        m.session = g_otaSession;
+        m.size    = (uint32_t)size;
+        bool answered = otaExchange(&m, sizeof(m), OTA_END_TIMEOUT_MS, ack);
+        g_otaActive = answered && ack.status == OTA_STATUS_OK;
+        otaReply(answered, ack, "BEGIN");
+        return;
+    }
+
+    if (n >= 1 && strcmp(f[0], "DATA") == 0) {
+        long offset;
+        OtaDataMessage m;
+        size_t len = 0;
+        if (!g_otaActive) {
+            Serial.println("$ERR,OTA,no update started");
+            return;
+        }
+        if (n < 3 || !parseLongField(f[1], 0, 16L * 1024 * 1024, &offset) ||
+            mbedtls_base64_decode(m.data, sizeof(m.data), &len,
+                                  reinterpret_cast<const unsigned char*>(f[2]), strlen(f[2])) != 0 ||
+            len == 0) {
+            Serial.println("$ERR,OTA,expected DATA,<offset>,<base64>");
+            return;
+        }
+        m.type    = MSG_OTA_DATA;
+        m.src     = MODULE_HANDHELD;
+        m.target  = g_otaTarget;
+        m.session = g_otaSession;
+        m.offset  = (uint32_t)offset;
+        otaReply(otaExchange(&m, offsetof(OtaDataMessage, data) + len, OTA_ACK_TIMEOUT_MS, ack),
+                 ack, nullptr);
+        return;
+    }
+
+    if (n >= 1 && (strcmp(f[0], "END") == 0 || strcmp(f[0], "ABORT") == 0)) {
+        bool end = strcmp(f[0], "END") == 0;
+        if (!g_otaActive) {
+            Serial.println("$ERR,OTA,no update started");
+            return;
+        }
+        OtaControlMessage m = {(uint8_t)(end ? MSG_OTA_END : MSG_OTA_ABORT), MODULE_HANDHELD,
+                               g_otaTarget, g_otaSession};
+        bool answered = otaExchange(&m, sizeof(m), end ? OTA_END_TIMEOUT_MS : OTA_ACK_TIMEOUT_MS, ack);
+        g_otaActive = false;
+        otaReply(answered, ack, f[0]);
+        return;
+    }
+
+    Serial.println("$ERR,OTA,expected BEGIN, DATA, END or ABORT");
+}
+
+// Handles the gateway's commands. Returns false for any other command.
+static bool handleGatewayCommand(const char* cmd, char* args) {
+    char* f[2] = {};
+
+    if (strcmp(cmd, "$MON") == 0) {
+        long flags;
+        if (splitFields(args, f, 1) < 1 || !parseLongField(f[0], 0, MON_LOGS | MON_TRAFFIC, &flags)) {
+            Serial.println("$ERR,MON,bad flags");
+            return true;
+        }
+        g_monFlags  = (uint8_t)flags;
+        g_monLastMs = millis();
+        Serial.println("$OK,MON");
+        return true;
+    }
+
+    if (strcmp(cmd, "$CMD") == 0) {
+        long module;
+        if (splitFields(args, f, 2) < 2 || !parseLongField(f[0], 0, 255, &module) || f[1][0] == '\0') {
+            Serial.println("$ERR,CMD,expected <module>,<text>");
+            return true;
+        }
+        RemoteCommandMessage m;
+        m.type   = MSG_REMOTE_COMMAND;
+        m.src    = MODULE_HANDHELD;
+        m.target = (uint8_t)module;
+        size_t len = min(strlen(f[1]), (size_t)REMOTE_COMMAND_TEXT_MAX);
+        memcpy(m.text, f[1], len);
+        esp_now_send(MESH_BROADCAST_ADDR, reinterpret_cast<uint8_t*>(&m),
+                     offsetof(RemoteCommandMessage, text) + len);
+        Serial.println("$OK,CMD");
+        return true;
+    }
+
+    if (strcmp(cmd, "$OTA") == 0) {
+        handleOtaCommand(args);
+        return true;
+    }
+    return false;
+}
+
 static void handleSerialCommand(char* line) {
     char* cmd = line;
     char* args = strchr(line, ',');
     if (args) *args++ = '\0';
     const char* name = cmd + 1;  // command name without the leading '$'
     char* f[5] = {};
+
+    if (handleGatewayCommand(cmd, args)) return;
 
     if (strcmp(cmd, "$HELLO") == 0) {
         Serial.printf("$HELLO,SAUNA_HANDHELD,%u,%u,%u,%u,%u,%u,%u\n",
@@ -931,6 +1210,12 @@ static void onDataRecv(const uint8_t* /*mac*/,
                        const uint8_t* data, int len) {
     if (len < 2) return;
     uint8_t type = data[0];
+
+    if (type == MSG_OTA_ACK) {
+        gatewayRecordAck(data, len);
+        return;
+    }
+    gatewayForward(data, len);
 
     if (type == MSG_NAV_STATUS && len >= (int)sizeof(NavigationMessage)) {
         NavigationMessage m;
@@ -1761,6 +2046,7 @@ static void handleMenuInput(const JoystickReading& joy, unsigned long now) {
 // setup()
 // ---------------------------------------------------------------------------
 void setup() {
+    Serial.setRxBufferSize(1024);  // room for a whole $OTA,DATA line
     Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
     for (int i = 0; i < 30 && !Serial; i++) delay(100);
@@ -1835,6 +2121,7 @@ void setup() {
     Serial.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
                   WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
 
+    g_gatewayQueue = xQueueCreate(16, sizeof(GatewayPacket));
     if (esp_now_init() != ESP_OK) {
         Serial.println("[Setup] ERROR: ESP-NOW init failed!");
     } else {
@@ -1870,6 +2157,7 @@ void loop() {
     handleMenuInput(joy, now);
     processSerialInput(now);
     processRouteTransfer(now);
+    gatewayLoop(now);
 
     // Activity detection: any deflection or button press resets the idle timer.
     if (fabsf(joy.x) > 0.05f || fabsf(joy.y) > 0.05f || joy.button) {

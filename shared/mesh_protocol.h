@@ -16,7 +16,6 @@
 
 // ---------------------------------------------------------------------------
 // WiFi channel used by all modules for ESP-NOW (must match across all nodes).
-// The steering module's soft-AP is pinned to this channel.
 // ---------------------------------------------------------------------------
 #define MESH_WIFI_CHANNEL 1
 
@@ -118,6 +117,41 @@
 //   reason uses ROUTE_ABORT_* constants below.
 #define MSG_ROUTE_ABORT 0x11
 
+// ---------------------------------------------------------------------------
+// Remote access through the handheld (see shared/mesh_remote.h)
+// ---------------------------------------------------------------------------
+// The steering and navigation boards' USB ports are hard to reach on the
+// boat, so the handheld relays between its USB port and the mesh
+// (tools/mesh_gateway): it forwards their logs to a computer, and serial
+// commands and firmware updates to them.
+
+// MSG_REMOTE_PING – broadcast by the handheld about once a second while a
+//   computer is listening through its USB port. Modules broadcast their log
+//   (MSG_REMOTE_LOG) while pings keep arriving and answer each ping with
+//   MSG_REMOTE_INFO.
+#define MSG_REMOTE_PING 0x12
+
+// MSG_REMOTE_INFO – broadcast by a module at boot and in answer to a ping:
+//   firmware build time, reset reason, uptime and update state.
+#define MSG_REMOTE_INFO 0x13
+
+// MSG_REMOTE_LOG – one line of a module's serial log.
+#define MSG_REMOTE_LOG 0x14
+
+// MSG_REMOTE_COMMAND – sent by the handheld: text handled by the target
+//   module as if it had been typed into its serial port.
+#define MSG_REMOTE_COMMAND 0x15
+
+// MSG_OTA_BEGIN / DATA / END / ABORT – sent by the handheld to write new
+//   firmware to one module (the target). The target answers each with
+//   MSG_OTA_ACK; the handheld resends anything that isn't acknowledged.
+//   The image is checked against its MD5 before the module restarts into it.
+#define MSG_OTA_BEGIN 0x16
+#define MSG_OTA_DATA  0x17
+#define MSG_OTA_END   0x18
+#define MSG_OTA_ABORT 0x19
+#define MSG_OTA_ACK   0x1A
+
 // Parameter IDs for MSG_AP_TUNING
 #define AP_PARAM_KP         0
 #define AP_PARAM_KI         1
@@ -153,6 +187,23 @@
 #define ROUTE_ABORT_NO_HEADING      5
 #define ROUTE_ABORT_STOP_REQUESTED  6
 #define ROUTE_ABORT_EMPTY_ROUTE     7
+
+// REMOTE_FW_* for MSG_REMOTE_INFO.otaState.
+#define REMOTE_FW_CONFIRMED   0  // running firmware is kept
+#define REMOTE_FW_UNCONFIRMED 1  // just updated: kept once it hears the mesh, else rolled back
+#define REMOTE_FW_UPDATING    2  // receiving new firmware
+
+// OTA_STATUS_* for MSG_OTA_ACK.
+#define OTA_STATUS_OK         0
+#define OTA_STATUS_BUSY       1  // module is steering the boat (heading hold or a route)
+#define OTA_STATUS_TOO_BIG    2  // image doesn't fit the module's update partition
+#define OTA_STATUS_FLASH      3  // couldn't write the update partition
+#define OTA_STATUS_VERIFY     4  // image incomplete, MD5 mismatch, or not an app for this chip
+#define OTA_STATUS_NO_SESSION 5  // no update in progress with this session
+
+#define REMOTE_LOG_TEXT_MAX     240
+#define REMOTE_COMMAND_TEXT_MAX 64
+#define OTA_CHUNK_MAX           240
 
 // ---------------------------------------------------------------------------
 // Button bitmask flags used in ControllerInputMessage.buttons
@@ -283,6 +334,70 @@ struct RouteAbortMessage {
     uint8_t  routeId;
     uint8_t  reason;    // ROUTE_ABORT_*
 };  // 4 bytes
+
+struct RemotePingMessage {
+    uint8_t  type;      // MSG_REMOTE_PING
+    uint8_t  src;       // MODULE_HANDHELD
+};  // 2 bytes
+
+struct RemoteInfoMessage {
+    uint8_t  type;        // MSG_REMOTE_INFO
+    uint8_t  src;         // module reporting
+    uint8_t  resetReason; // esp_reset_reason_t of the last restart
+    uint8_t  otaState;    // REMOTE_FW_*
+    uint32_t uptimeS;
+    char     build[24];   // firmware build date and time, null-terminated
+};  // 32 bytes
+
+// Sent with only as much of text[] as the line needs (no terminator).
+struct RemoteLogMessage {
+    uint8_t  type;      // MSG_REMOTE_LOG
+    uint8_t  src;       // module logging
+    uint8_t  seq;       // +1 per line; a gap means lines were dropped
+    char     text[REMOTE_LOG_TEXT_MAX];
+};  // 3 + text bytes
+
+// Sent with only as much of text[] as the command needs (no terminator).
+struct RemoteCommandMessage {
+    uint8_t  type;      // MSG_REMOTE_COMMAND
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  target;    // MODULE_* that should run it
+    char     text[REMOTE_COMMAND_TEXT_MAX];
+};  // 3 + text bytes
+
+struct OtaBeginMessage {
+    uint8_t  type;      // MSG_OTA_BEGIN
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  target;    // MODULE_* being updated
+    uint8_t  session;   // picked per update; packets from other sessions are ignored
+    uint32_t size;      // image size in bytes
+    uint8_t  md5[16];   // MD5 of the whole image
+};  // 24 bytes
+
+// Sent with only as much of data[] as the chunk needs.
+struct OtaDataMessage {
+    uint8_t  type;      // MSG_OTA_DATA
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  target;
+    uint8_t  session;
+    uint32_t offset;    // position of data[0] in the image
+    uint8_t  data[OTA_CHUNK_MAX];
+};  // 8 + data bytes
+
+struct OtaControlMessage {
+    uint8_t  type;      // MSG_OTA_END or MSG_OTA_ABORT
+    uint8_t  src;       // MODULE_HANDHELD
+    uint8_t  target;
+    uint8_t  session;
+};  // 4 bytes
+
+struct OtaAckMessage {
+    uint8_t  type;       // MSG_OTA_ACK
+    uint8_t  src;        // module being updated
+    uint8_t  session;
+    uint8_t  status;     // OTA_STATUS_*
+    uint32_t nextOffset; // bytes received so far: where the next chunk should start
+};  // 8 bytes
 #pragma pack(pop)
 
 // Broadcast MAC address – send here to reach every ESP-NOW peer at once.
