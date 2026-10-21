@@ -73,7 +73,7 @@ static float g_apRateLimit  = 0.05f;   // max change in output per autopilot tic
 // ---------------------------------------------------------------------------
 // Route following (see route_track.h)
 // ---------------------------------------------------------------------------
-static constexpr float ROUTE_LOOKAHEAD_M = 10.0f; // steer for the point this far along the track beyond the boat
+static constexpr float ROUTE_LOOKAHEAD_M = 30.0f; // steer for the point this far along the track beyond the boat
 
 // ---------------------------------------------------------------------------
 // Peripherals

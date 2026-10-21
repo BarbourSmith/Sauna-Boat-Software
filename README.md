@@ -98,7 +98,7 @@ on a map with the [route planner](#route-planner) and uploaded over USB.
 The navigation module follows the route as a track — the line through the
 waypoints — rather than steering for each waypoint in turn. It joins the
 track at the point closest to the boat (so a route can be started from
-anywhere along it) and steers for a point 10 m further along the track.
+anywhere along it) and steers for a point 30 m further along the track.
 Progress only moves forward: a waypoint the boat misses is left behind, not
 circled back for. Only the last waypoint's radius matters; the route
 finishes inside it, or once the boat is past the end.
