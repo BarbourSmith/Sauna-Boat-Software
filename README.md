@@ -95,6 +95,14 @@ be recorded on the device (Navigation → Routes → Append current) or planned
 on a map with the [route planner](#route-planner) and uploaded over USB.
 "Send + Start" sends the active route to the navigation module.
 
+The navigation module follows the route as a track — the line through the
+waypoints — rather than steering for each waypoint in turn. It joins the
+track at the point closest to the boat (so a route can be started from
+anywhere along it) and steers for a point 30 m further along the track.
+Progress only moves forward: a waypoint the boat misses is left behind, not
+circled back for. Only the last waypoint's radius matters; the route
+finishes inside it, or once the boat is past the end.
+
 **Build & flash:**
 ```bash
 cd modules/handheld_controller
@@ -114,7 +122,8 @@ Actions**). Once deployed it lives at
 - Shows all 10 controller route slots on an OpenStreetMap / satellite map
   with OpenSeaMap sea marks.
 - Click the map to add waypoints, drag to move, click a **+** between two
-  points to insert one; set each waypoint's arrival radius (1–100 m).
+  points to insert one; set each waypoint's arrival radius (1–100 m; only
+  the last waypoint's is used, to decide when the route is finished).
 - Plug the handheld into a computer with USB and press **Connect
   controller** (Chrome or Edge on desktop — it uses the Web Serial API).
   The planner reads every route, shows which have unsaved changes, uploads

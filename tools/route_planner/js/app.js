@@ -464,7 +464,7 @@ function renderWaypointList() {
       el('span', { class: `wp-num${idx === 0 ? ' start' : ''}` }, String(idx + 1)),
       position,
       el('span', { class: 'wp-leg', title: idx ? 'Distance from the previous waypoint' : null }, leg),
-      el('label', { class: 'wp-radius', title: 'Arrival radius: the boat counts the waypoint as reached inside this distance' }, radius, 'm'),
+      el('label', { class: 'wp-radius', title: 'Arrival radius. The boat follows the line through the waypoints without needing to reach them, so only the last waypoint\'s radius is used: the route finishes inside it' }, radius, 'm'),
       el('button', {
         class: 'icon-btn wp-delete', type: 'button', title: 'Delete waypoint', 'data-key': `delete-${idx}`,
         onclick: () => deleteWaypoint(idx),
