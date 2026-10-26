@@ -2,8 +2,6 @@
 // Plain ESP32 — reads a BMM150 3-axis magnetometer (I2C) and NEO-6M GPS
 // (UART2) and broadcasts position + heading to other modules via ESP-NOW.
 //
-// Web UI at http://192.168.4.1 — connect to WiFi AP "SaunaBoatNav".
-//
 // Wiring:
 //   BMM150  SDA  → GPIO 21      NEO-6M  TX → GPIO 16  (UART2 RX)
 //   BMM150  SCL  → GPIO 22      NEO-6M  RX → GPIO 17  (UART2 TX)
@@ -15,13 +13,11 @@
 #include <esp_now.h>
 #include <esp_system.h>
 #include <Preferences.h>
-#include <LittleFS.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
 #include <TinyGPSPlus.h>
 #include <DFRobot_BMM150.h>
 #include "mesh_protocol.h"
 #include "route_track.h"
+#include "mesh_remote.h"  // logs, commands and firmware updates through the handheld
 
 // ---------------------------------------------------------------------------
 // Pin definitions
@@ -35,12 +31,6 @@
 #define BMM150_I2C_ADDR  0x13  // BMM150 default I2C address
 
 // ---------------------------------------------------------------------------
-// WiFi Access Point credentials
-// ---------------------------------------------------------------------------
-static const char* AP_SSID = "SaunaBoatNav";
-static const char* AP_PASS = "12345678";
-
-// ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
 static constexpr unsigned long NAV_BROADCAST_MS  = 500;   // 2 Hz mesh broadcast
@@ -49,7 +39,6 @@ static constexpr unsigned long CAL_DURATION_MS   = 45000; // calibration collect
 static constexpr unsigned long CAL_PROGRESS_MS   = 1000;  // calibration progress prints
 static constexpr unsigned long AUTOPILOT_MS      = 200;   // 5 Hz autopilot compute rate
 static constexpr unsigned long AP_SEND_MS        = 50;    // 20 Hz send rate — must be well under the steering watchdog (200 ms)
-static constexpr unsigned long WS_BROADCAST_MS   = 200;   // 5 Hz WebSocket status broadcast
 static constexpr float         STICK_OVERRIDE_ENTER = 0.20f; // enter manual-yield above this magnitude
 static constexpr float         STICK_OVERRIDE_EXIT  = 0.10f; // remain in manual-yield until below this magnitude
 static constexpr unsigned long CTRL_INPUT_TIMEOUT_MS = 1000; // controller input considered stale after this
@@ -120,8 +109,6 @@ public:
 static TinyGPSPlus        gps;
 static CheckedBMM150      bmm150(&Wire, BMM150_I2C_ADDR);
 static Preferences        prefs;
-static AsyncWebServer     server(80);
-static AsyncWebSocket     ws("/ws");
 
 // ---------------------------------------------------------------------------
 // State
@@ -159,7 +146,6 @@ static float g_calOffsetZ = 0.0f;
 static bool  g_calibrated = false;
 
 // Calibration collection state
-static volatile bool g_calRequested = false; // set by the web UI; started from loop() so I2C stays on one task
 static bool          g_calActive    = false;
 static unsigned long g_calStartTime = 0;
 static float g_calMinX, g_calMaxX;
@@ -222,8 +208,8 @@ static void loadTuningFromNVS() {
         prefs.putFloat("apMax", g_apMaxOutput);
     }
 
-    Serial.printf("[Setup] Autopilot tuning: Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f\n",
-                  g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
+    Log.printf("[Setup] Autopilot tuning: Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f\n",
+               g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
 }
 
 static void saveTuningToNVS() {
@@ -245,11 +231,11 @@ static void calLoadFromNVS() {
     g_calOffsetZ = prefs.getFloat("calZ", 0.0f);
     g_calibrated = prefs.getBool("calOk", false);
     if (g_calibrated) {
-        Serial.printf("[Cal] Loaded offsets from NVS: X=%.2f  Y=%.2f  Z=%.2f\n",
-                      g_calOffsetX, g_calOffsetY, g_calOffsetZ);
+        Log.printf("[Cal] Loaded offsets from NVS: X=%.2f  Y=%.2f  Z=%.2f\n",
+                   g_calOffsetX, g_calOffsetY, g_calOffsetZ);
     } else {
-        Serial.println("[Cal] No saved calibration — heading may be inaccurate.");
-        Serial.println("[Cal] Send 'c' over serial to start calibration.");
+        Log.println("[Cal] No saved calibration — heading may be inaccurate.");
+        Log.println("[Cal] Send 'c' over serial to start calibration.");
     }
 }
 
@@ -262,14 +248,14 @@ static void calSaveToNVS() {
 
 static void calStart() {
     if (!compassHeadingValid()) {
-        Serial.println("[Cal] ERROR: BMM150 not responding — cannot calibrate.");
+        Log.println("[Cal] ERROR: BMM150 not responding — cannot calibrate.");
         return;
     }
-    Serial.println("[Cal] ========================================");
-    Serial.println("[Cal]  COMPASS CALIBRATION STARTED");
-    Serial.printf( "[Cal]  Slowly rotate the sensor through all\n");
-    Serial.printf( "[Cal]  orientations for %lu seconds…\n", CAL_DURATION_MS / 1000);
-    Serial.println("[Cal] ========================================");
+    Log.println("[Cal] ========================================");
+    Log.println("[Cal]  COMPASS CALIBRATION STARTED");
+    Log.printf( "[Cal]  Slowly rotate the sensor through all\n");
+    Log.printf( "[Cal]  orientations for %lu seconds…\n", CAL_DURATION_MS / 1000);
+    Log.println("[Cal] ========================================");
 
     g_calMinX = g_calMaxX = g_lastMag.x;
     g_calMinY = g_calMaxY = g_lastMag.y;
@@ -298,12 +284,12 @@ static void calFinish() {
 
     calSaveToNVS();
 
-    Serial.println("[Cal] ========================================");
-    Serial.println("[Cal]  CALIBRATION COMPLETE — offsets saved.");
-    Serial.printf( "[Cal]  X: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinX, g_calMaxX, g_calOffsetX);
-    Serial.printf( "[Cal]  Y: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinY, g_calMaxY, g_calOffsetY);
-    Serial.printf( "[Cal]  Z: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinZ, g_calMaxZ, g_calOffsetZ);
-    Serial.println("[Cal] ========================================");
+    Log.println("[Cal] ========================================");
+    Log.println("[Cal]  CALIBRATION COMPLETE — offsets saved.");
+    Log.printf( "[Cal]  X: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinX, g_calMaxX, g_calOffsetX);
+    Log.printf( "[Cal]  Y: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinY, g_calMaxY, g_calOffsetY);
+    Log.printf( "[Cal]  Z: min=%.2f  max=%.2f  offset=%.2f\n", g_calMinZ, g_calMaxZ, g_calOffsetZ);
+    Log.println("[Cal] ========================================");
 }
 
 // ---------------------------------------------------------------------------
@@ -393,12 +379,12 @@ static void compassMarkLost(const char* why, unsigned long now) {
     g_bmm150Ok = false;
     g_compassLastInitMs = now - COMPASS_RETRY_MS;  // retry straight away
     ++g_compassLostCount;
-    Serial.printf("[Compass] LOST (%s) — reinitialising. Lost %lu time(s) since boot.\n",
-                  why, (unsigned long)g_compassLostCount);
+    Log.printf("[Compass] LOST (%s) — reinitialising. Lost %lu time(s) since boot.\n",
+               why, (unsigned long)g_compassLostCount);
     if (g_calActive) {
         // Finishing now would save offsets from too few samples.
         g_calActive = false;
-        Serial.println("[Cal] Calibration aborted — compass lost. Previous calibration kept.");
+        Log.println("[Cal] Calibration aborted — compass lost. Previous calibration kept.");
     }
 }
 
@@ -410,7 +396,7 @@ static void updateCompass(unsigned long now) {
     if (!g_bmm150Ok) {
         if (now - g_compassLastInitMs < COMPASS_RETRY_MS) return;
         if (!compassTryInit(now)) return;
-        Serial.println("[Compass] BMM150 initialised (30 Hz, high accuracy).");
+        Log.println("[Compass] BMM150 initialised (30 Hz, high accuracy).");
     }
 
     sBmm150MagData_t mag;
@@ -498,14 +484,14 @@ static void engageHeadingHold() {
     g_prevError         = 0.0f;
     g_integral          = 0.0f;
     g_prevErrorTime     = millis();
-    Serial.printf("[AP] Heading hold ENGAGED at %.1f°\n", g_targetHeading);
+    Log.printf("[AP] Heading hold ENGAGED at %.1f°\n", g_targetHeading);
 }
 
 static void disengageHeadingHold() {
     if (!g_headingHoldActive) return;
     g_headingHoldActive = false;
     g_apOutput          = 0.0f;
-    Serial.println("[AP] Heading hold DISENGAGED — manual control.");
+    Log.println("[AP] Heading hold DISENGAGED — manual control.");
 }
 
 // ---------------------------------------------------------------------------
@@ -527,8 +513,33 @@ static void onDataSent(const wifi_tx_info_t* /*tx_info*/, esp_now_send_status_t 
         ++g_sendOkCount;
     } else {
         ++g_sendFailCount;
-        Serial.println("[Mesh] WARNING: Send FAILED!");
+        Log.println("[Mesh] WARNING: Send FAILED!");
     }
+}
+
+// esp_now_send() errors never reach onDataSent(); report them here instead,
+// at most every 10 s.
+// Radio health, reported every MESH_HEALTH_LOG_MS and used by
+// checkMeshRadio() to repair the radio.
+static uint32_t      g_sendErrCount     = 0;
+static esp_err_t     g_lastSendErr      = ESP_OK;
+static unsigned long g_sendFailingSince = 0;  // 0 while sends are succeeding
+static unsigned long g_staStartWaitMs   = 0;  // how long the station took to start
+static uint32_t      g_radioRestarts    = 0;
+static uint32_t      g_channelFixes     = 0;
+
+static void reportSendError(esp_err_t err) {
+    static unsigned long lastReport = 0;
+    if (err == ESP_OK) {
+        g_sendFailingSince = 0;
+        return;
+    }
+    ++g_sendErrCount;
+    g_lastSendErr = err;
+    if (g_sendFailingSince == 0) g_sendFailingSince = millis();
+    if (lastReport != 0 && millis() - lastReport < 10000) return;
+    lastReport = millis();
+    Log.printf("[Mesh] WARNING: esp_now_send failed: %s\n", esp_err_to_name(err));
 }
 
 static void broadcastNavStatus() {
@@ -556,8 +567,8 @@ static void broadcastNavStatus() {
     // rather than a stale or made-up one.
     msg.heading = compassHeadingValid() ? g_heading : NAN;
 
-    esp_now_send(MESH_BROADCAST_ADDR,
-                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    reportSendError(esp_now_send(MESH_BROADCAST_ADDR,
+                                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg)));
     ++g_sendCount;
 }
 
@@ -700,9 +711,9 @@ static bool startRouteExecution() {
         engageHeadingHold();
     }
     broadcastRouteStatus(ROUTE_STATE_RUNNING);
-    Serial.printf("[Route] START route=%u waypoints=%u, joining %.0f m along the %.0f m track (next wp %u)\n",
-                  g_routeId, g_routeCount, g_routeGuide.progressM, g_routeGuide.lengthM,
-                  g_routeCurrentIndex + 1);
+    Log.printf("[Route] START route=%u waypoints=%u, joining %.0f m along the %.0f m track (next wp %u)\n",
+               g_routeId, g_routeCount, g_routeGuide.progressM, g_routeGuide.lengthM,
+               g_routeCurrentIndex + 1);
     return true;
 }
 
@@ -737,7 +748,7 @@ static void updateRouteGuidance() {
         broadcastRouteStatus(ROUTE_STATE_COMPLETE);
         disengageHeadingHold();
         sendSteeringSpeed(0.0f);
-        Serial.println("[Route] COMPLETE");
+        Log.println("[Route] COMPLETE");
         return;
     }
 
@@ -751,6 +762,7 @@ static void updateRouteGuidance() {
 // ESP-NOW receive callback
 // ---------------------------------------------------------------------------
 static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* data, int len) {
+    if (meshRemoteReceive(data, len)) return;
     if (len < 2) return;
     uint8_t type = data[0];
 
@@ -783,8 +795,8 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         g_integral = 0.0f;  // reset integral when tuning changes
         saveTuningToNVS();
         broadcastApTuningStatus();
-        Serial.printf("[APTune] param=%u val=%.4f (Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f)\n",
-                      paramId, value, g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
+        Log.printf("[APTune] param=%u val=%.4f (Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f)\n",
+                   paramId, value, g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
         return;
     }
 
@@ -809,8 +821,8 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         g_routeStartRequested = false;
         memset(g_routePoints, 0, sizeof(g_routePoints));
         broadcastRouteStatus(ROUTE_STATE_UPLOADING);
-        Serial.printf("[Route] START upload route=%u wps=%u chunks=%u\n",
-                      g_routeId, g_routeExpectedWaypoints, g_routeExpectedChunks);
+        Log.printf("[Route] START upload route=%u wps=%u chunks=%u\n",
+                   g_routeId, g_routeExpectedWaypoints, g_routeExpectedChunks);
         return;
     }
 
@@ -870,7 +882,7 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
         g_routeCount = g_routeReceivedWaypoints;
         resetRouteUploadState();
         broadcastRouteStatus(ROUTE_STATE_READY);
-        Serial.printf("[Route] Upload complete route=%u wps=%u\n", g_routeId, g_routeCount);
+        Log.printf("[Route] Upload complete route=%u wps=%u\n", g_routeId, g_routeCount);
         return;
     }
 
@@ -890,58 +902,6 @@ static void onMeshReceive(const esp_now_recv_info_t* /*info*/, const uint8_t* da
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket helpers
-// ---------------------------------------------------------------------------
-static void buildStatusJson(String& out) {
-    float err = headingError(g_heading, g_targetHeading);
-    out = "{\"hdg\":";       out += String(g_heading, 1);
-    out += ",\"magOk\":";    out += compassHeadingValid() ? "true" : "false";
-    out += ",\"magLost\":";  out += (unsigned long)g_compassLostCount;
-    out += ",\"reset\":\"";  out += g_resetReason; out += "\"";
-    out += ",\"cal\":";      out += g_calibrated ? "true" : "false";
-    out += ",\"calActive\":"; out += g_calActive ? "true" : "false";
-    if (g_calActive) {
-        unsigned long elapsed = millis() - g_calStartTime;
-        unsigned long remaining = (elapsed < CAL_DURATION_MS) ? (CAL_DURATION_MS - elapsed) / 1000 : 0;
-        out += ",\"calRemain\":"; out += remaining;
-    }
-    out += ",\"hold\":";     out += g_headingHoldActive ? "true" : "false";
-    out += ",\"target\":";   out += String(g_targetHeading, 1);
-    out += ",\"err\":";      out += String(err, 1);
-    out += ",\"steer\":";    out += String(g_apOutput, 3);
-    out += ",\"ctrl\":";     out += g_ctrlOnline ? "true" : "false";
-    out += ",\"stick\":";    out += String(g_stickLX, 2);
-    out += ",\"routeId\":"; out += (unsigned long)g_routeId;
-    out += ",\"routeCount\":"; out += (unsigned long)g_routeCount;
-    out += ",\"routeIdx\":"; out += (unsigned long)g_routeCurrentIndex;
-    out += ",\"routeRun\":"; out += g_routeRunning ? "true" : "false";
-    out += ",\"routeUp\":"; out += g_routeUploadActive ? "true" : "false";
-    out += ",\"routeDist\":"; out += (unsigned long)g_routeDistanceM;
-    out += ",\"routeAlong\":"; out += String(g_routeGuide.progressM, 0);
-    out += ",\"routeLen\":"; out += String(g_routeGuide.lengthM, 0);
-    out += ",\"routeXte\":"; out += String(g_routeGuide.crossTrackM, 1);
-    out += ",\"gpsFix\":";   out += gps.location.isValid() ? "true" : "false";
-    out += ",\"gpsSats\":";  out += (unsigned long)gps.satellites.value();
-    if (gps.location.isValid()) {
-        out += ",\"lat\":";  out += String(gps.location.lat(), 6);
-        out += ",\"lon\":";  out += String(gps.location.lng(), 6);
-        out += ",\"spd\":";  out += String(gps.speed.knots(), 1);
-        out += ",\"crs\":";  out += String(gps.course.deg(), 1);
-    }
-    out += ",\"gpsChars\":"; out += (unsigned long)gps.charsProcessed();
-    out += "}";
-}
-
-static void onWsEvent(AsyncWebSocket* /*srv*/, AsyncWebSocketClient* client,
-                      AwsEventType type, void* /*arg*/, uint8_t* /*data*/, size_t /*len*/) {
-    if (type == WS_EVT_CONNECT) {
-        Serial.printf("[WS] Client #%u connected\n", client->id());
-    } else if (type == WS_EVT_DISCONNECT) {
-        Serial.printf("[WS] Client #%u disconnected\n", client->id());
-    }
-}
-
 static const char* resetReasonName(esp_reset_reason_t reason) {
     switch (reason) {
         case ESP_RST_POWERON:   return "power-on";
@@ -958,27 +918,139 @@ static const char* resetReasonName(esp_reset_reason_t reason) {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh radio
+// ---------------------------------------------------------------------------
+static constexpr unsigned long MESH_CHECK_MS        = 2000;
+static constexpr unsigned long MESH_RESTART_AFTER_MS = 5000;   // sends failing this long → restart the radio
+static constexpr unsigned long MESH_HEALTH_LOG_MS   = 30000;
+
+// Brings up the WiFi station and ESP-NOW on MESH_WIFI_CHANNEL. Also used to
+// restart them when sending stops working.
+static void startMeshRadio() {
+    // Arduino 3 starts the station in the background; the channel can only be
+    // set, and ESP-NOW can only send, once it has started.
+    unsigned long start = millis();
+    WiFi.mode(WIFI_STA);
+    for (int i = 0; i < 500 && !WiFi.STA.started(); ++i) delay(10);
+    g_staStartWaitMs = millis() - start;
+    // The station defaults to modem sleep, which (without an access point to
+    // keep the radio awake) starves ESP-NOW: sends queue up and fail with
+    // ESP_ERR_ESPNOW_NO_MEM.
+    WiFi.setSleep(false);
+    esp_err_t chanErr = esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    uint8_t channel = 0;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&channel, &second);
+    Log.printf("[Setup] WiFi MAC: %s  started=%d after %lu ms  channel %u (set: %s)\n",
+               WiFi.macAddress().c_str(), WiFi.STA.started() ? 1 : 0, g_staStartWaitMs,
+               channel, esp_err_to_name(chanErr));
+
+    if (esp_now_init() != ESP_OK) {
+        Log.println("[Setup] ERROR: ESP-NOW init failed!");
+    } else {
+        Log.println("[Setup] ESP-NOW initialised.");
+    }
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onMeshReceive);
+
+    // Register the broadcast peer so this module can send to the mesh.
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
+    peer.channel = MESH_WIFI_CHANNEL;
+    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) == ESP_OK) {
+        Log.println("[Setup] Broadcast peer registered.");
+    } else {
+        Log.println("[Setup] WARNING: Failed to register broadcast peer.");
+    }
+}
+
+// Keeps the radio on the mesh channel and restarts it if sends keep failing,
+// so the module recovers by itself instead of needing a USB connection.
+static void checkMeshRadio(unsigned long now) {
+    static unsigned long lastCheck = 0;
+    static unsigned long lastHealth = 0;
+    if (now - lastCheck >= MESH_CHECK_MS) {
+        lastCheck = now;
+        uint8_t channel = 0;
+        wifi_second_chan_t second;
+        if (esp_wifi_get_channel(&channel, &second) == ESP_OK && channel != MESH_WIFI_CHANNEL) {
+            ++g_channelFixes;
+            Log.printf("[Mesh] WARNING: radio was on channel %u; moving it back to %d.\n",
+                       channel, MESH_WIFI_CHANNEL);
+            esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        }
+        if (g_sendFailingSince != 0 && now - g_sendFailingSince >= MESH_RESTART_AFTER_MS) {
+            ++g_radioRestarts;
+            Log.printf("[Mesh] WARNING: sends failing for %lu s (%s); restarting the radio.\n",
+                       (now - g_sendFailingSince) / 1000, esp_err_to_name(g_lastSendErr));
+            esp_now_deinit();
+            WiFi.mode(WIFI_OFF);
+            delay(100);
+            startMeshRadio();
+            g_sendFailingSince = 0;
+        }
+    }
+    if (now - lastHealth >= MESH_HEALTH_LOG_MS) {
+        lastHealth = now;
+        uint8_t channel = 0;
+        wifi_second_chan_t second;
+        esp_wifi_get_channel(&channel, &second);
+        Log.printf("[Mesh] health: channel %u, station %s (took %lu ms), sends %lu, "
+                   "errors %lu (last %s), radio restarts %lu, channel fixes %lu, up %lu s\n",
+                   channel, WiFi.STA.started() ? "started" : "NOT started", g_staStartWaitMs,
+                   (unsigned long)g_sendCount, (unsigned long)g_sendErrCount,
+                   esp_err_to_name(g_lastSendErr), (unsigned long)g_radioRestarts,
+                   (unsigned long)g_channelFixes, now / 1000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands, typed into the serial port or sent through the handheld
+// ---------------------------------------------------------------------------
+// 'c' starts compass calibration.
+static void handleCommand(char ch) {
+    if (ch == 'c' || ch == 'C') {
+        if (g_calActive) {
+            Log.println("[Cal] Calibration already in progress…");
+        } else {
+            calStart();
+        }
+    }
+}
+
+static void onRemoteCommand(const char* text) {
+    for (const char* p = text; *p; ++p) handleCommand(*p);
+}
+
+// New firmware isn't accepted while the autopilot is steering the boat.
+static bool canUpdateFirmware() {
+    return !g_headingHoldActive && !g_routeRunning;
+}
+
+// ---------------------------------------------------------------------------
 // Arduino setup
 // ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== Sauna Boat Navigation Module ===");
+    Log.println("\n=== Sauna Boat Navigation Module ===");
     g_resetReason = resetReasonName(esp_reset_reason());
-    Serial.printf("[Setup] Reset reason: %s\n", g_resetReason);
+    Log.printf("[Setup] Reset reason: %s\n", g_resetReason);
 
     // --- GPS (UART2) ---
     Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.printf("[Setup] GPS UART2 started (RX=%d TX=%d @ %d baud)\n",
-                  GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
+    Log.printf("[Setup] GPS UART2 started (RX=%d TX=%d @ %d baud)\n",
+               GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
 
     // --- BMM150 (I2C) ---
     // Don't wait here for the compass: if it's wedged after a reset the mesh
     // would never come up. loop() keeps retrying until it responds.
     if (compassTryInit(millis())) {
-        Serial.println("[Setup] BMM150 magnetometer initialised (30 Hz, high accuracy).");
+        Log.println("[Setup] BMM150 magnetometer initialised (30 Hz, high accuracy).");
     } else {
-        Serial.println("[Setup] WARNING: BMM150 not responding — will keep retrying.");
+        Log.println("[Setup] WARNING: BMM150 not responding — will keep retrying.");
     }
 
     // --- NVS ---
@@ -986,153 +1058,35 @@ void setup() {
     calLoadFromNVS();
     loadTuningFromNVS();
 
-    // --- LittleFS ---
-    if (!LittleFS.begin(true)) {
-        Serial.println("[Setup] ERROR: LittleFS mount failed!");
-    } else {
-        Serial.println("[Setup] LittleFS mounted.");
-    }
-
-    // --- WiFi AP+STA + ESP-NOW ---
-    // AP_STA mode is required so the STA interface is available for ESP-NOW
-    // reception while the AP interface serves the web UI.
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS, MESH_WIFI_CHANNEL);
-    WiFi.disconnect();  // STA not joining any network, just kept active for ESP-NOW
-    esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[Setup] WiFi AP \"%s\" on channel %d started.\n", AP_SSID, MESH_WIFI_CHANNEL);
-    Serial.printf("[Setup] Open http://%s in your browser.\n", ip.toString().c_str());
-
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[Setup] ERROR: ESP-NOW init failed!");
-    } else {
-        Serial.println("[Setup] ESP-NOW initialised.");
-    }
-    esp_now_register_send_cb(onDataSent);
-    esp_now_register_recv_cb(onMeshReceive);
-
-    // Register broadcast peer on BOTH interfaces so ESP-NOW works regardless
-    // of which interface the sender used.
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
-    peer.channel = MESH_WIFI_CHANNEL;
-    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) == ESP_OK) {
-        Serial.println("[Setup] Broadcast peer registered.");
-    } else {
-        Serial.println("[Setup] WARNING: Failed to register broadcast peer.");
-    }
-
-    // --- WebSocket ---
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws);
-
-    // --- HTTP routes ---
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send(LittleFS, "/index.html", "text/html");
-    });
-
-    // GET /settings — returns autopilot tuning as JSON
-    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest* request) {
-        String json = "{\"kp\":";    json += String(g_apKp, 4);
-        json += ",\"ki\":";          json += String(g_apKi, 4);
-        json += ",\"kd\":";          json += String(g_apKd, 4);
-        json += ",\"maxOutput\":";   json += String(g_apMaxOutput, 3);
-        json += ",\"deadband\":";    json += String(g_apDeadband, 1);
-        json += ",\"rateLimit\":";   json += String(g_apRateLimit, 4);
-        json += "}";
-        request->send(200, "application/json", json);
-    });
-
-    // POST /settings — save autopilot tuning
-    static String settingsBody;
-    server.on("/settings", HTTP_POST,
-        [](AsyncWebServerRequest* request) {
-            auto parseField = [](const String& json, const char* key, float fallback) -> float {
-                String search = "\""; search += key; search += "\":";
-                int idx = json.indexOf(search);
-                if (idx < 0) return fallback;
-                return json.substring(idx + search.length()).toFloat();
-            };
-
-            g_apKp        = parseField(settingsBody, "kp",        g_apKp);
-            g_apKi        = parseField(settingsBody, "ki",        g_apKi);
-            g_apKd        = parseField(settingsBody, "kd",        g_apKd);
-            g_apMaxOutput = parseField(settingsBody, "maxOutput",  g_apMaxOutput);
-            g_apDeadband  = parseField(settingsBody, "deadband",   g_apDeadband);
-            g_apRateLimit = parseField(settingsBody, "rateLimit",  g_apRateLimit);
-
-            // Clamp to sane ranges
-            g_apKp        = constrain(g_apKp,        0.0f, 1.0f);
-            g_apKi        = constrain(g_apKi,        0.0f, 1.0f);
-            g_apKd        = constrain(g_apKd,        0.0f, 5.0f);
-            g_apMaxOutput = constrain(g_apMaxOutput,  0.05f, 1.0f);
-            g_apDeadband  = constrain(g_apDeadband,   0.0f, 30.0f);
-            g_apRateLimit = constrain(g_apRateLimit,  0.001f, 1.0f);
-
-            saveTuningToNVS();
-
-            // Reset integral when tuning changes to prevent stale buildup
-            g_integral = 0.0f;
-
-            Serial.printf("[Settings] Saved — Kp=%.4f Ki=%.4f Kd=%.3f max=%.2f dead=%.1f rate=%.3f\n",
-                          g_apKp, g_apKi, g_apKd, g_apMaxOutput, g_apDeadband, g_apRateLimit);
-            request->send(200, "application/json", "{\"ok\":true}");
-        },
-        nullptr,
-        [](AsyncWebServerRequest*, uint8_t* data, size_t len,
-           size_t index, size_t) {
-            if (index == 0) settingsBody = "";
-            settingsBody += String(reinterpret_cast<const char*>(data), len);
-        }
-    );
-
-    // POST /calibrate — trigger compass calibration from the web UI
-    server.on("/calibrate", HTTP_POST, [](AsyncWebServerRequest* request) {
-        if (g_calActive) {
-            request->send(200, "application/json", "{\"ok\":false,\"msg\":\"already running\"}");
-        } else {
-            g_calRequested = true;
-            request->send(200, "application/json", "{\"ok\":true}");
-        }
-    });
-
-    server.begin();
-    Serial.println("[Setup] HTTP server started.");
+    // --- WiFi + ESP-NOW ---
+    startMeshRadio();
+    meshRemoteBegin(MODULE_NAVIGATION, canUpdateFirmware, onRemoteCommand);
 
     // If loop() ever hangs, reboot (after 5 s) rather than sit dead until
     // someone power-cycles the module.
     enableLoopWDT();
 
-    Serial.println("[Setup] Navigation module ready.");
-    Serial.println("[Setup] Send 'c' over serial to calibrate compass.");
-    Serial.println("[Setup] D-pad UP on controller to engage heading hold.");
+    Log.println("[Setup] Navigation module ready.");
+    Log.println("[Setup] Send 'c' over serial or the mesh gateway to calibrate compass.");
+    Log.println("[Setup] D-pad UP on controller to engage heading hold.");
 }
 
 // ---------------------------------------------------------------------------
 // Arduino loop
 // ---------------------------------------------------------------------------
 void loop() {
+    if (meshRemoteLoop()) return;  // receiving new firmware
+
     static unsigned long lastBroadcast  = 0;
     static unsigned long lastLog        = 0;
     static unsigned long lastCalProg    = 0;
     static unsigned long lastAutopilot  = 0;
     static unsigned long lastApSend     = 0;
-    static unsigned long lastWsBcast    = 0;
     unsigned long now = millis();
 
     // --- Serial command handling ---
     while (Serial.available()) {
-        char ch = Serial.read();
-        if (ch == 'c' || ch == 'C') {
-            if (g_calActive) {
-                Serial.println("[Cal] Calibration already in progress…");
-            } else {
-                calStart();
-            }
-        }
+        handleCommand(Serial.read());
     }
 
     // Feed all available GPS bytes into the parser.
@@ -1144,16 +1098,11 @@ void loop() {
     // re-initialises the sensor if it has stopped responding).
     updateCompass(now);
 
-    if (g_calRequested) {
-        g_calRequested = false;
-        if (!g_calActive) calStart();
-    }
-
     // While the compass is down the autopilot is paused (see below). If it
     // doesn't come back, hand control back to the operator.
     if (g_headingHoldActive && !compassHeadingValid() &&
         now - g_compassLastHeadingMs >= COMPASS_LOST_HOLD_MS) {
-        Serial.println("[AP] Compass lost — releasing heading hold.");
+        Log.println("[AP] Compass lost — releasing heading hold.");
         if (g_routeRunning) {
             abortRoute(ROUTE_ABORT_NO_HEADING);
         } else {
@@ -1198,7 +1147,7 @@ void loop() {
 
             if (manualOverride) {
                 if (!g_headingHoldYielding) {
-                    Serial.println("[AP] HOLD YIELDING to manual stick input.");
+                    Log.println("[AP] HOLD YIELDING to manual stick input.");
                 }
                 g_headingHoldYielding = true;
                 g_lastManualOverrideMs = now;
@@ -1215,7 +1164,7 @@ void loop() {
                     // Keep yielding until centered state is stable.
                 } else {
                 if (g_headingHoldYielding) {
-                    Serial.println("[AP] HOLD RESUMED.");
+                    Log.println("[AP] HOLD RESUMED.");
                 }
                 g_headingHoldYielding = false;
 
@@ -1247,12 +1196,12 @@ void loop() {
         } else if (now - lastCalProg >= CAL_PROGRESS_MS) {
             lastCalProg = now;
             unsigned long remaining = (CAL_DURATION_MS - elapsed) / 1000;
-            Serial.printf("[Cal] Collecting… %lus remaining  "
-                          "X=[%.1f, %.1f]  Y=[%.1f, %.1f]  Z=[%.1f, %.1f]\n",
-                          remaining,
-                          g_calMinX, g_calMaxX,
-                          g_calMinY, g_calMaxY,
-                          g_calMinZ, g_calMaxZ);
+            Log.printf("[Cal] Collecting… %lus remaining  "
+                       "X=[%.1f, %.1f]  Y=[%.1f, %.1f]  Z=[%.1f, %.1f]\n",
+                       remaining,
+                       g_calMinX, g_calMaxX,
+                       g_calMinY, g_calMaxY,
+                       g_calMinZ, g_calMaxZ);
         }
     }
 
@@ -1273,22 +1222,7 @@ void loop() {
         }
     }
 
-    // Broadcast status to WebSocket clients.
-    if (now - lastWsBcast >= WS_BROADCAST_MS) {
-        lastWsBcast = now;
-        if (ws.count() > 0) {
-            String json;
-            buildStatusJson(json);
-            ws.textAll(json);
-        }
-    }
-
-    // Periodically clean up disconnected WebSocket clients.
-    static unsigned long lastCleanup = 0;
-    if (now - lastCleanup >= 1000) {
-        lastCleanup = now;
-        ws.cleanupClients();
-    }
+    checkMeshRadio(now);
 
     // Periodic serial diagnostics.
     if (!g_calActive && (now - lastLog >= DIAG_LOG_MS)) {
@@ -1299,33 +1233,33 @@ void loop() {
 
         if (g_headingHoldActive) {
             float err = headingError(g_heading, g_targetHeading);
-            Serial.printf("[AP] %s %.1f°  hdg=%.1f°  err=%+.1f°  steer=%+.3f\n",
-                          g_headingHoldYielding ? "YIELD" : "HOLD",
-                          g_targetHeading, g_heading, err, g_apOutput);
+            Log.printf("[AP] %s %.1f°  hdg=%.1f°  err=%+.1f°  steer=%+.3f\n",
+                       g_headingHoldYielding ? "YIELD" : "HOLD",
+                       g_targetHeading, g_heading, err, g_apOutput);
         } else {
-            Serial.printf("[AP] MANUAL  hdg=%.1f° [%s]  stick=%.2f\n",
-                          g_heading, calTag, g_stickLX);
+            Log.printf("[AP] MANUAL  hdg=%.1f° [%s]  stick=%.2f\n",
+                       g_heading, calTag, g_stickLX);
         }
 
         if (g_routeRunning) {
-            Serial.printf("[Route] next wp %u/%u %um  along %.0f/%.0fm  off-track %+.1fm\n",
-                          g_routeCurrentIndex + 1, g_routeCount, g_routeDistanceM,
-                          g_routeGuide.progressM, g_routeGuide.lengthM, g_routeGuide.crossTrackM);
+            Log.printf("[Route] next wp %u/%u %um  along %.0f/%.0fm  off-track %+.1fm\n",
+                       g_routeCurrentIndex + 1, g_routeCount, g_routeDistanceM,
+                       g_routeGuide.progressM, g_routeGuide.lengthM, g_routeGuide.crossTrackM);
         }
 
         if (gps.location.isValid()) {
-            Serial.printf("[Nav] GPS: %.6f, %.6f  sats=%lu  spd=%.1fkn  crs=%.1f°\n",
-                          gps.location.lat(), gps.location.lng(),
-                          (unsigned long)gps.satellites.value(),
-                          gps.speed.knots(), gps.course.deg());
+            Log.printf("[Nav] GPS: %.6f, %.6f  sats=%lu  spd=%.1fkn  crs=%.1f°\n",
+                       gps.location.lat(), gps.location.lng(),
+                       (unsigned long)gps.satellites.value(),
+                       gps.speed.knots(), gps.course.deg());
         } else if (gps.charsProcessed() < 10) {
-            Serial.printf("[Nav] GPS: NO DATA (check wiring: TX→GPIO%d, baud=%d)\n",
-                          GPS_RX_PIN, GPS_BAUD);
+            Log.printf("[Nav] GPS: NO DATA (check wiring: TX→GPIO%d, baud=%d)\n",
+                       GPS_RX_PIN, GPS_BAUD);
         } else {
-            Serial.printf("[Nav] GPS: WAITING FOR FIX  sats=%lu  sentences=%lu  failed=%lu\n",
-                          (unsigned long)gps.satellites.value(),
-                          gps.sentencesWithFix(),
-                          gps.failedChecksum());
+            Log.printf("[Nav] GPS: WAITING FOR FIX  sats=%lu  sentences=%lu  failed=%lu\n",
+                       (unsigned long)gps.satellites.value(),
+                       gps.sentencesWithFix(),
+                       gps.failedChecksum());
         }
     }
 

@@ -12,14 +12,15 @@ message, and any other module can listen and act on it.
 ```
 .
 ├── shared/
-│   └── mesh_protocol.h     ← inter-module message definitions (included by all modules)
+│   ├── mesh_protocol.h     ← inter-module message definitions (included by all modules)
+│   └── mesh_remote.h       ← steering/navigation side of the mesh gateway
 ├── tools/
-│   └── route_planner/      ← web route planner (GitHub Pages); uploads routes over USB
+│   ├── route_planner/      ← web route planner (GitHub Pages); uploads routes over USB
+│   └── mesh_gateway/       ← logs, commands and firmware updates through the handheld
 └── modules/
     ├── steering/            ← ESP32-S3 on Maslow 4 board; drives the rudder motor
     │   ├── platformio.ini
-    │   ├── src/             ← C++ firmware
-    │   └── data/            ← LittleFS web UI (index.html)
+    │   └── src/             ← C++ firmware
     └── handheld_controller/ ← ESP32-S3 (Pavloff board); custom handheld with
         ├── platformio.ini     analog joystick, SSD1306 OLED, MPU-6050 wake-on-
         └── src/               motion, and on-board LiPo
@@ -41,15 +42,13 @@ position feedback. Runs a PID loop to hold a target heading.
 **Interfaces:**
 | Interface | Details |
 |-----------|---------|
-| WiFi AP | SSID `SaunaBoatSteering`, password `12345678`, IP `192.168.4.1` |
-| Web UI | Open `http://192.168.4.1` — compass display, heading slider, PID settings |
 | ESP-NOW | Receives `MSG_SET_ANGLE` from any module on WiFi channel 1 |
 
 **Build & flash:**
 ```bash
 cd modules/steering
-pio run -t upload       # flash firmware
-pio run -t uploadfs     # flash web UI (index.html → LittleFS)
+pio run -t upload       # flash firmware over USB
+pio run -t meshupload   # or over the mesh, through the handheld (see below)
 ```
 
 ---
@@ -73,8 +72,9 @@ deadzone applied here beyond the joystick centring band).
 `MSG_NAV_STATUS`), rudder actual → target (from `MSG_ANGLE_STATUS`), and a
 live joystick crosshair.
 
-**Power:** auto deep-sleep after 60 s of no stick deflection or button
-press. Wakes on either MPU-6050 motion (EXT1, GPIO 18) or the joystick
+**Power:** auto deep-sleep after 3 minutes of no stick deflection, button
+press or USB command (the idle sleep setting in the Settings menu turns it
+off). Wakes on either MPU-6050 motion (EXT1, GPIO 18) or the joystick
 button (EXT0, GPIO 6 LOW). Toggle motion-wake by writing the `wakeOnMove`
 bool in the `settings` Preferences namespace.
 
@@ -154,6 +154,58 @@ $GET,0        → $ROUTE,0,2,Harbor loop
 Uploads are staged (`$PUT` → `$WP`… → `$COMMIT`) and only replace the stored
 route once every waypoint has arrived and validated.
 
+The same port also carries the mesh gateway's `$MON`, `$CMD` and `$OTA`
+commands, listed in the "USB gateway to the mesh" section of the same file.
+
+---
+
+## Debugging and updating over the mesh
+
+The steering and navigation boards' USB ports are hard to reach on the boat,
+so the handheld doubles as a gateway: plug the handheld into the laptop and
+`tools/mesh_gateway/gateway.py` reaches the other modules over ESP-NOW. No
+WiFi network is involved, so the laptop can stay on a phone hotspot.
+
+From a module's folder (`modules/navigation`, `modules/steering`, or the repo
+root for the steering firmware in `src/`):
+
+```bash
+pio run -t meshupload    # build, then install over the mesh
+pio run -t meshmonitor   # show every module's log
+```
+
+Or run the script with any Python that has pyserial (PlatformIO's does):
+
+```bash
+python tools/mesh_gateway/gateway.py monitor             # logs; --traffic adds decoded mesh messages
+python tools/mesh_gateway/gateway.py command navigation c   # start compass calibration
+python tools/mesh_gateway/gateway.py upload navigation modules/navigation/.pio/build/navigation/firmware.bin
+```
+
+How it behaves:
+
+- **Logs.** Steering and navigation print through `Log` (`shared/mesh_remote.h`):
+  output still goes to their USB port and, while the gateway is listening,
+  is also broadcast over the mesh. Prints from other source files (such as
+  `RCServo.cpp`) only reach the USB port.
+- **Commands.** Text sent with `command` is handled as if typed into the
+  module's serial port. Navigation takes `c` to calibrate the compass.
+- **Updates.** The image is written to the module's spare app partition and
+  checked (length, MD5, valid app for that chip) before the module restarts
+  into it; a failed or interrupted transfer leaves the running firmware
+  alone. Navigation refuses an update while heading hold or a route is
+  active. While receiving, a module ignores all other mesh messages, so the
+  rudder holds where it was: update at the dock.
+- **Rollback.** New firmware is kept once it hears the mesh. If it crashes
+  before then, or hears nothing for two minutes, the bootloader goes back to
+  the previous firmware.
+- **First time.** Each board needs one USB flash of firmware with this code
+  before it can be updated over the mesh, and the handheld needs its own
+  update over its USB port.
+- The mesh isn't authenticated: anything in ESP-NOW range that speaks the
+  protocol could send firmware, just as it can already send steering
+  commands.
+
 ---
 
 ## Mesh protocol
@@ -172,9 +224,8 @@ All inter-module traffic uses the structs and constants in `shared/mesh_protocol
 | `MSG_SET_STEERING` | `0x01` | handheld_controller / navigation | normalized steering [-1.0, 1.0] | — |
 | `MSG_ANGLE_STATUS` | `0x02` | steering | current angle (°) | target angle (°) |
 
-All modules use **WiFi channel 1** (`MESH_WIFI_CHANNEL`). The steering module's
-soft-AP is pinned to that channel so phone connections and ESP-NOW coexist on
-the same radio.
+All modules use **WiFi channel 1** (`MESH_WIFI_CHANNEL`). None of them hosts a
+web page or creates a WiFi network; the radio is used only for ESP-NOW.
 
 ---
 
