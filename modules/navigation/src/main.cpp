@@ -519,9 +519,25 @@ static void onDataSent(const wifi_tx_info_t* /*tx_info*/, esp_now_send_status_t 
 
 // esp_now_send() errors never reach onDataSent(); report them here instead,
 // at most every 10 s.
+// Radio health, reported every MESH_HEALTH_LOG_MS and used by
+// checkMeshRadio() to repair the radio.
+static uint32_t      g_sendErrCount     = 0;
+static esp_err_t     g_lastSendErr      = ESP_OK;
+static unsigned long g_sendFailingSince = 0;  // 0 while sends are succeeding
+static unsigned long g_staStartWaitMs   = 0;  // how long the station took to start
+static uint32_t      g_radioRestarts    = 0;
+static uint32_t      g_channelFixes     = 0;
+
 static void reportSendError(esp_err_t err) {
     static unsigned long lastReport = 0;
-    if (err == ESP_OK || (lastReport != 0 && millis() - lastReport < 10000)) return;
+    if (err == ESP_OK) {
+        g_sendFailingSince = 0;
+        return;
+    }
+    ++g_sendErrCount;
+    g_lastSendErr = err;
+    if (g_sendFailingSince == 0) g_sendFailingSince = millis();
+    if (lastReport != 0 && millis() - lastReport < 10000) return;
     lastReport = millis();
     Log.printf("[Mesh] WARNING: esp_now_send failed: %s\n", esp_err_to_name(err));
 }
@@ -902,6 +918,95 @@ static const char* resetReasonName(esp_reset_reason_t reason) {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh radio
+// ---------------------------------------------------------------------------
+static constexpr unsigned long MESH_CHECK_MS        = 2000;
+static constexpr unsigned long MESH_RESTART_AFTER_MS = 5000;   // sends failing this long → restart the radio
+static constexpr unsigned long MESH_HEALTH_LOG_MS   = 30000;
+
+// Brings up the WiFi station and ESP-NOW on MESH_WIFI_CHANNEL. Also used to
+// restart them when sending stops working.
+static void startMeshRadio() {
+    // Arduino 3 starts the station in the background; the channel can only be
+    // set, and ESP-NOW can only send, once it has started.
+    unsigned long start = millis();
+    WiFi.mode(WIFI_STA);
+    for (int i = 0; i < 500 && !WiFi.STA.started(); ++i) delay(10);
+    g_staStartWaitMs = millis() - start;
+    // The station defaults to modem sleep, which (without an access point to
+    // keep the radio awake) starves ESP-NOW: sends queue up and fail with
+    // ESP_ERR_ESPNOW_NO_MEM.
+    WiFi.setSleep(false);
+    esp_err_t chanErr = esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    uint8_t channel = 0;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&channel, &second);
+    Log.printf("[Setup] WiFi MAC: %s  started=%d after %lu ms  channel %u (set: %s)\n",
+               WiFi.macAddress().c_str(), WiFi.STA.started() ? 1 : 0, g_staStartWaitMs,
+               channel, esp_err_to_name(chanErr));
+
+    if (esp_now_init() != ESP_OK) {
+        Log.println("[Setup] ERROR: ESP-NOW init failed!");
+    } else {
+        Log.println("[Setup] ESP-NOW initialised.");
+    }
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onMeshReceive);
+
+    // Register the broadcast peer so this module can send to the mesh.
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
+    peer.channel = MESH_WIFI_CHANNEL;
+    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) == ESP_OK) {
+        Log.println("[Setup] Broadcast peer registered.");
+    } else {
+        Log.println("[Setup] WARNING: Failed to register broadcast peer.");
+    }
+}
+
+// Keeps the radio on the mesh channel and restarts it if sends keep failing,
+// so the module recovers by itself instead of needing a USB connection.
+static void checkMeshRadio(unsigned long now) {
+    static unsigned long lastCheck = 0;
+    static unsigned long lastHealth = 0;
+    if (now - lastCheck >= MESH_CHECK_MS) {
+        lastCheck = now;
+        uint8_t channel = 0;
+        wifi_second_chan_t second;
+        if (esp_wifi_get_channel(&channel, &second) == ESP_OK && channel != MESH_WIFI_CHANNEL) {
+            ++g_channelFixes;
+            Log.printf("[Mesh] WARNING: radio was on channel %u; moving it back to %d.\n",
+                       channel, MESH_WIFI_CHANNEL);
+            esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        }
+        if (g_sendFailingSince != 0 && now - g_sendFailingSince >= MESH_RESTART_AFTER_MS) {
+            ++g_radioRestarts;
+            Log.printf("[Mesh] WARNING: sends failing for %lu s (%s); restarting the radio.\n",
+                       (now - g_sendFailingSince) / 1000, esp_err_to_name(g_lastSendErr));
+            esp_now_deinit();
+            WiFi.mode(WIFI_OFF);
+            delay(100);
+            startMeshRadio();
+            g_sendFailingSince = 0;
+        }
+    }
+    if (now - lastHealth >= MESH_HEALTH_LOG_MS) {
+        lastHealth = now;
+        uint8_t channel = 0;
+        wifi_second_chan_t second;
+        esp_wifi_get_channel(&channel, &second);
+        Log.printf("[Mesh] health: channel %u, station %s (took %lu ms), sends %lu, "
+                   "errors %lu (last %s), radio restarts %lu, channel fixes %lu, up %lu s\n",
+                   channel, WiFi.STA.started() ? "started" : "NOT started", g_staStartWaitMs,
+                   (unsigned long)g_sendCount, (unsigned long)g_sendErrCount,
+                   esp_err_to_name(g_lastSendErr), (unsigned long)g_radioRestarts,
+                   (unsigned long)g_channelFixes, now / 1000);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commands, typed into the serial port or sent through the handheld
 // ---------------------------------------------------------------------------
 // 'c' starts compass calibration.
@@ -954,41 +1059,7 @@ void setup() {
     loadTuningFromNVS();
 
     // --- WiFi + ESP-NOW ---
-    // Arduino 3 starts the station in the background; the channel can only be
-    // set, and ESP-NOW can only send, once it has started.
-    WiFi.mode(WIFI_STA);
-    for (int i = 0; i < 200 && !WiFi.STA.started(); ++i) delay(10);
-    // The station defaults to modem sleep, which (without an access point to
-    // keep the radio awake) starves ESP-NOW: sends queue up and fail with
-    // ESP_ERR_ESPNOW_NO_MEM.
-    WiFi.setSleep(false);
-    esp_err_t chanErr = esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    uint8_t channel = 0;
-    wifi_second_chan_t second;
-    esp_wifi_get_channel(&channel, &second);
-    Log.printf("[Setup] WiFi MAC: %s  started=%d  channel %u (set: %s)\n",
-               WiFi.macAddress().c_str(), WiFi.STA.started() ? 1 : 0, channel,
-               esp_err_to_name(chanErr));
-
-    if (esp_now_init() != ESP_OK) {
-        Log.println("[Setup] ERROR: ESP-NOW init failed!");
-    } else {
-        Log.println("[Setup] ESP-NOW initialised.");
-    }
-    esp_now_register_send_cb(onDataSent);
-    esp_now_register_recv_cb(onMeshReceive);
-
-    // Register the broadcast peer so this module can send to the mesh.
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, MESH_BROADCAST_ADDR, 6);
-    peer.channel = MESH_WIFI_CHANNEL;
-    peer.ifidx   = WIFI_IF_STA;  // receive/send via STA interface
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) == ESP_OK) {
-        Log.println("[Setup] Broadcast peer registered.");
-    } else {
-        Log.println("[Setup] WARNING: Failed to register broadcast peer.");
-    }
+    startMeshRadio();
     meshRemoteBegin(MODULE_NAVIGATION, canUpdateFirmware, onRemoteCommand);
 
     // If loop() ever hangs, reboot (after 5 s) rather than sit dead until
@@ -1150,6 +1221,8 @@ void loop() {
             broadcastRouteStatus(ROUTE_STATE_IDLE);
         }
     }
+
+    checkMeshRadio(now);
 
     // Periodic serial diagnostics.
     if (!g_calActive && (now - lastLog >= DIAG_LOG_MS)) {
