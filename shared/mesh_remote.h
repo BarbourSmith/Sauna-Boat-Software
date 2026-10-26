@@ -63,6 +63,7 @@ static volatile bool          g_remoteHeardMesh   = false;
 static volatile bool          g_remoteUpdating    = false;
 static bool                   g_remoteUnconfirmed = false;  // booted from an update that isn't kept yet
 static uint8_t                g_remoteSession     = 0;
+static uint32_t               g_remoteReceived    = 0;  // image bytes accepted so far
 static unsigned long          g_remoteLastOtaMs   = 0;
 
 // The log line being built, guarded by g_remoteLogMutex.
@@ -147,7 +148,9 @@ static void remoteAck(uint8_t session, uint8_t status) {
     m.src        = g_remoteModule;
     m.session    = session;
     m.status     = status;
-    m.nextOffset = g_remoteUpdating ? (uint32_t)Update.progress() : 0;
+    // Not Update.progress(): that only counts bytes once a whole flash sector
+    // has been written.
+    m.nextOffset = g_remoteUpdating ? g_remoteReceived : 0;
     remoteSend(&m, sizeof(m));
 }
 
@@ -186,6 +189,7 @@ static void remoteHandleBegin(const RemotePacket& p) {
 
     g_remoteUpdating  = true;
     g_remoteSession   = m.session;
+    g_remoteReceived  = 0;
     g_remoteLastOtaMs = millis();
     Log.printf("[Remote] Receiving new firmware (%lu bytes).\n", (unsigned long)m.size);
     remoteAck(m.session, OTA_STATUS_OK);
@@ -205,11 +209,14 @@ static void remoteHandleData(const RemotePacket& p) {
     // Only the chunk that continues the image is written; for anything else
     // the ack's nextOffset tells the handheld where to carry on from.
     size_t n = p.len - header;
-    if (m.offset == Update.progress() && Update.write(m.data, n) != n) {
-        Log.printf("[Remote] Flash write failed: %s\n", Update.errorString());
-        remoteAck(m.session, OTA_STATUS_FLASH);
-        remoteStopUpdate("flash write failed");
-        return;
+    if (m.offset == g_remoteReceived) {
+        if (Update.write(m.data, n) != n) {
+            Log.printf("[Remote] Flash write failed: %s\n", Update.errorString());
+            remoteAck(m.session, OTA_STATUS_FLASH);
+            remoteStopUpdate("flash write failed");
+            return;
+        }
+        g_remoteReceived += n;
     }
     remoteAck(m.session, OTA_STATUS_OK);
 }

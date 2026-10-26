@@ -649,9 +649,12 @@ static void sanitizeRouteName(const char* in, char* out, size_t outSize) {
 //   $RX,<packet as hex>
 static constexpr unsigned long GATEWAY_MON_MS     = 5000;
 static constexpr unsigned long GATEWAY_PING_MS    = 1000;
-static constexpr unsigned long OTA_ACK_TIMEOUT_MS = 250;   // per try, for a chunk
+// About 1 in 10 acks is lost on the air, so chunks are resent quickly; a
+// module erasing flash can take longer, so keep trying for up to 2 s.
+static constexpr unsigned long OTA_ACK_TIMEOUT_MS = 40;    // per try, for a chunk
+static constexpr int           OTA_CHUNK_TRIES    = 50;
 static constexpr unsigned long OTA_END_TIMEOUT_MS = 3000;  // per try; BEGIN and END take the module longer
-static constexpr int           OTA_TRIES          = 5;
+static constexpr int           OTA_END_TRIES      = 5;
 static constexpr uint8_t       MON_LOGS           = 1;
 static constexpr uint8_t       MON_TRAFFIC        = 2;
 
@@ -732,8 +735,9 @@ static void gatewayLoop(unsigned long now) {
 
 // Sends msg to the module being updated and waits for its MSG_OTA_ACK,
 // resending when none comes. Returns false if the module never answered.
-static bool otaExchange(const void* msg, size_t len, unsigned long timeoutMs, OtaAckMessage& ack) {
-    for (int attempt = 0; attempt < OTA_TRIES; ++attempt) {
+static bool otaExchange(const void* msg, size_t len, unsigned long timeoutMs, int tries,
+                        OtaAckMessage& ack) {
+    for (int attempt = 0; attempt < tries; ++attempt) {
         portENTER_CRITICAL(&g_otaAckMux);
         g_otaAckFresh = false;
         portEXIT_CRITICAL(&g_otaAckMux);
@@ -808,7 +812,7 @@ static void handleOtaCommand(char* args) {
         m.target  = g_otaTarget;
         m.session = g_otaSession;
         m.size    = (uint32_t)size;
-        bool answered = otaExchange(&m, sizeof(m), OTA_END_TIMEOUT_MS, ack);
+        bool answered = otaExchange(&m, sizeof(m), OTA_END_TIMEOUT_MS, OTA_END_TRIES, ack);
         g_otaActive = answered && ack.status == OTA_STATUS_OK;
         otaReply(answered, ack, "BEGIN");
         return;
@@ -834,7 +838,8 @@ static void handleOtaCommand(char* args) {
         m.target  = g_otaTarget;
         m.session = g_otaSession;
         m.offset  = (uint32_t)offset;
-        otaReply(otaExchange(&m, offsetof(OtaDataMessage, data) + len, OTA_ACK_TIMEOUT_MS, ack),
+        otaReply(otaExchange(&m, offsetof(OtaDataMessage, data) + len, OTA_ACK_TIMEOUT_MS,
+                             OTA_CHUNK_TRIES, ack),
                  ack, nullptr);
         return;
     }
@@ -847,7 +852,8 @@ static void handleOtaCommand(char* args) {
         }
         OtaControlMessage m = {(uint8_t)(end ? MSG_OTA_END : MSG_OTA_ABORT), MODULE_HANDHELD,
                                g_otaTarget, g_otaSession};
-        bool answered = otaExchange(&m, sizeof(m), end ? OTA_END_TIMEOUT_MS : OTA_ACK_TIMEOUT_MS, ack);
+        bool answered = end ? otaExchange(&m, sizeof(m), OTA_END_TIMEOUT_MS, OTA_END_TRIES, ack)
+                            : otaExchange(&m, sizeof(m), OTA_ACK_TIMEOUT_MS, OTA_CHUNK_TRIES, ack);
         g_otaActive = false;
         otaReply(answered, ack, f[0]);
         return;
@@ -1045,7 +1051,21 @@ static void handleSerialCommand(char* line) {
 }
 
 static void processSerialInput(unsigned long now) {
-    while (Serial.available() > 0) {
+    // During a firmware update the computer sends each chunk as soon as the
+    // last is acknowledged. Keep reading for a while instead of making every
+    // chunk wait a whole loop() (display redraw included), but give loop() a
+    // turn at least every 300 ms.
+    unsigned long start = millis();
+    unsigned long lastLine = start;
+    for (;;) {
+        if (Serial.available() <= 0) {
+            unsigned long t = millis();
+            if (g_otaActive && t - lastLine < 30 && t - start < 300) {
+                delay(1);
+                continue;
+            }
+            break;
+        }
         int ch = Serial.read();
         if (ch < 0) break;
         if (ch == '\r') continue;
@@ -1072,6 +1092,7 @@ static void processSerialInput(unsigned long now) {
         }
         g_serialLineLen = 0;
         g_serialLineOverflow = false;
+        lastLine = millis();
     }
 }
 
