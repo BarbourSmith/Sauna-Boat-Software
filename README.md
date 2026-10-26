@@ -72,8 +72,9 @@ deadzone applied here beyond the joystick centring band).
 `MSG_NAV_STATUS`), rudder actual → target (from `MSG_ANGLE_STATUS`), and a
 live joystick crosshair.
 
-**Power:** auto deep-sleep after 60 s of no stick deflection or button
-press. Wakes on either MPU-6050 motion (EXT1, GPIO 18) or the joystick
+**Power:** auto deep-sleep after 3 minutes of no stick deflection, button
+press or USB command (the idle sleep setting in the Settings menu turns it
+off). Wakes on either MPU-6050 motion (EXT1, GPIO 18) or the joystick
 button (EXT0, GPIO 6 LOW). Toggle motion-wake by writing the `wakeOnMove`
 bool in the `settings` Preferences namespace.
 

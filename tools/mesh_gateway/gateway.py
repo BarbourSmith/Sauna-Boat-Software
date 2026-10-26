@@ -251,6 +251,8 @@ class Printer:
         if len(pkt) < 2:
             return
         key = (pkt[0], pkt[1])
+        if pkt[0] == 0x09:
+            key += (pkt[2:6],)  # autopilot settings: once a second per setting
         if pkt[0] in PERIODIC:
             now = time.monotonic()
             if now - self.last_shown.get(key, 0) < 1.0:
@@ -260,7 +262,7 @@ class Printer:
 
 
 # Messages sent several times a second; --traffic shows each at most once a second.
-PERIODIC = {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0E}
+PERIODIC = {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0E}
 
 AP_PARAMS = ["Kp", "Ki", "Kd", "max output", "deadband", "rate limit"]
 ROUTE_STATES = ["idle", "uploading", "ready", "running", "aborted", "complete"]

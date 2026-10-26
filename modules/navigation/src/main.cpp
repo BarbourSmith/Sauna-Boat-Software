@@ -517,6 +517,15 @@ static void onDataSent(const wifi_tx_info_t* /*tx_info*/, esp_now_send_status_t 
     }
 }
 
+// esp_now_send() errors never reach onDataSent(); report them here instead,
+// at most every 10 s.
+static void reportSendError(esp_err_t err) {
+    static unsigned long lastReport = 0;
+    if (err == ESP_OK || (lastReport != 0 && millis() - lastReport < 10000)) return;
+    lastReport = millis();
+    Log.printf("[Mesh] WARNING: esp_now_send failed: %s\n", esp_err_to_name(err));
+}
+
 static void broadcastNavStatus() {
     NavigationMessage msg = {};
     msg.type = MSG_NAV_STATUS;
@@ -542,8 +551,8 @@ static void broadcastNavStatus() {
     // rather than a stale or made-up one.
     msg.heading = compassHeadingValid() ? g_heading : NAN;
 
-    esp_now_send(MESH_BROADCAST_ADDR,
-                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg));
+    reportSendError(esp_now_send(MESH_BROADCAST_ADDR,
+                                 reinterpret_cast<uint8_t*>(&msg), sizeof(msg)));
     ++g_sendCount;
 }
 
@@ -945,11 +954,21 @@ void setup() {
     loadTuningFromNVS();
 
     // --- WiFi + ESP-NOW ---
+    // Arduino 3 starts the station in the background; the channel can only be
+    // set, and ESP-NOW can only send, once it has started.
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();  // not joining any network, just kept active for ESP-NOW
-    esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    Log.printf("[Setup] WiFi MAC: %s  (channel %d)\n",
-               WiFi.macAddress().c_str(), MESH_WIFI_CHANNEL);
+    for (int i = 0; i < 200 && !WiFi.STA.started(); ++i) delay(10);
+    // The station defaults to modem sleep, which (without an access point to
+    // keep the radio awake) starves ESP-NOW: sends queue up and fail with
+    // ESP_ERR_ESPNOW_NO_MEM.
+    WiFi.setSleep(false);
+    esp_err_t chanErr = esp_wifi_set_channel(MESH_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    uint8_t channel = 0;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&channel, &second);
+    Log.printf("[Setup] WiFi MAC: %s  started=%d  channel %u (set: %s)\n",
+               WiFi.macAddress().c_str(), WiFi.STA.started() ? 1 : 0, channel,
+               esp_err_to_name(chanErr));
 
     if (esp_now_init() != ESP_OK) {
         Log.println("[Setup] ERROR: ESP-NOW init failed!");

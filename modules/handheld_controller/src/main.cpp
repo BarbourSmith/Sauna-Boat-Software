@@ -716,7 +716,9 @@ static void gatewayPrintPacket(const GatewayPacket& p) {
 // Pings the modules while a computer is monitoring and relays what they send.
 static void gatewayLoop(unsigned long now) {
     static unsigned long lastPing = 0;
-    if (g_monFlags && now - g_monLastMs >= GATEWAY_MON_MS) g_monFlags = 0;
+    // millis(), not loop()'s `now`: $MON stamps g_monLastMs later in the same
+    // loop, and `now - g_monLastMs` would wrap around and end monitoring at once.
+    if (g_monFlags && millis() - g_monLastMs >= GATEWAY_MON_MS) g_monFlags = 0;
     if (g_monFlags && now - lastPing >= GATEWAY_PING_MS) {
         lastPing = now;
         RemotePingMessage ping = {MSG_REMOTE_PING, MODULE_HANDHELD};
